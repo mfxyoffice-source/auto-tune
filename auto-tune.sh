@@ -1097,7 +1097,25 @@ def install_self_and_service():
         f.write(SERVICE_TEMPLATE.format(install_path=install_path, env_path=ENV_PATH))
     run("systemctl daemon-reload")
     logging.info("systemd service 已安装到 %s", SERVICE_PATH)
+
+    install_ty_alias(install_path)
+
     return install_path
+
+
+def install_ty_alias(install_path):
+    """装一个短命令 ty，装完之后随便在哪都能直接打 ty 调出菜单，或者接子命令用
+    （比如 ty check、ty auto --link-mbit 1000），不用每次都打完整路径。
+    失败不影响主流程，只是没有这个快捷方式而已。"""
+    alias_path = "/usr/local/bin/ty"
+    content = f'#!/usr/bin/env bash\nexec python3 "{install_path}" "$@"\n'
+    try:
+        with open(alias_path, "w") as f:
+            f.write(content)
+        os.chmod(alias_path, 0o755)
+        logging.info("已安装快捷命令: 以后直接输入 ty 就能调出菜单（或者 ty check / ty auto 等接子命令用）")
+    except OSError as e:
+        logging.warning("安装快捷命令 ty 失败: %s（不影响其它功能，还是可以用完整路径调用）", e)
 
 
 def cmd_install_service(args):
