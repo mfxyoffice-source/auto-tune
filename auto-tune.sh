@@ -4,31 +4,19 @@
 # 用法：
 #   bash <(curl -Ls https://raw.githubusercontent.com/mfxyoffice-source/auto-tune/main/auto-tune.sh)
 #
-# 这个 bash 脚本本身不做网络调优的实际逻辑，只负责三件事：
-#   1. 检查 root 权限 / python3 是否存在
-#   2. 把内嵌的 Python 源码落盘到 /opt/auto-tune/auto-tune.py
-#   3. exec 执行它，把命令行参数原样透传（不带参数时会进入数字菜单）
-
 set -euo pipefail
-
 INSTALL_DIR="/opt/auto-tune"
 CONFIG_DIR="/etc/auto-tune"
 PY_PATH="$INSTALL_DIR/auto-tune.py"
-
 if [[ "$(id -u)" -ne 0 ]]; then
     echo "请用 root 权限运行" >&2
     exit 1
 fi
-
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "未找到 python3，请先安装后重试，例如：" >&2
-    echo "  apt update && apt install -y python3   # Debian/Ubuntu" >&2
-    echo "  yum install -y python3                 # CentOS/RHEL" >&2
+    echo "未找到 python3，请先安装后重试" >&2
     exit 1
 fi
-
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
-
 cat > "$PY_PATH" <<'PYEOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -120,6 +108,12 @@ RETRANS_PCT_THRESHOLD=2.0
 # 单周期新增 qdisc drop 超过这个数视为异常
 DROP_THRESHOLD=1
 
+# CPU 总体繁忙占比超过这个百分比视为异常（说明瓶颈可能不在网络，是算力扛不住了）
+CPU_PCT_THRESHOLD=90.0
+
+# 软中断（处理网卡收发/转发的那部分 CPU 开销）占比超过这个百分比视为异常
+SOFTIRQ_PCT_THRESHOLD=30.0
+
 # 是否真正下发 tc 命令。首次部署强烈建议先 false，观察日志确认判断合理再改 true。
 APPLY=false
 """
@@ -164,9 +158,9 @@ def setup_logging():
     )
 
 
-def run(cmd, check=True):
+def run(cmd, check=True, timeout=10):
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         if check and result.returncode != 0:
             logging.warning("命令失败: %s\nstderr: %s", cmd, result.stderr.strip())
         return result.stdout
@@ -359,6 +353,93 @@ def detect_link_speed_mbit(iface):
     return None
 
 
+def run_speedtest(download_bytes=30_000_000, upload_bytes=15_000_000, timeout=25):
+    """用 Cloudflare 公开的测速接口做一次真实的上传/下载测速，不需要你自己准备对端机器。
+    返回 (down_mbit, up_mbit)，任一项测不出来就是 None。
+
+    注意：这只是单次、单一路径（到 Cloudflare 边缘节点）的粗略测速，跟文章里强调的
+    "不要拿单一 peer 的数字当全局真相"是同一个道理——能比"网卡自称的速率"更接近真实，
+    但仍然不如你自己找真实业务 peer 用 iperf3 测得准。"""
+    down_mbit, up_mbit = None, None
+
+    try:
+        t0 = time.time()
+        out = run(
+            f'curl -o /dev/null -s -w "%{{size_download}}" '
+            f'"https://speed.cloudflare.com/__down?bytes={download_bytes}" '
+            f'--max-time {timeout}',
+            check=False, timeout=timeout + 5,
+        )
+        elapsed = time.time() - t0
+        downloaded = int((out or "0").strip() or 0)
+        if downloaded > 1_000_000 and elapsed > 0.3:
+            down_mbit = (downloaded * 8) / elapsed / 1_000_000
+    except Exception as e:
+        logging.warning("下载测速失败: %s", e)
+
+    try:
+        t0 = time.time()
+        out = run(
+            f'head -c {upload_bytes} /dev/urandom | curl -X POST --data-binary @- -s '
+            f'-w "%{{size_upload}}" "https://speed.cloudflare.com/__up" --max-time {timeout}',
+            check=False, timeout=timeout + 5,
+        )
+        elapsed = time.time() - t0
+        uploaded = int((out or "0").strip() or 0)
+        if uploaded > 1_000_000 and elapsed > 0.3:
+            up_mbit = (uploaded * 8) / elapsed / 1_000_000
+    except Exception as e:
+        logging.warning("上传测速失败: %s", e)
+
+    return down_mbit, up_mbit
+
+
+def cmd_speedtest(args):
+    logging.info("开始测速（用 Cloudflare 边缘节点，会消耗一些流量，耗时数秒到十几秒）...")
+    down_mbit, up_mbit = run_speedtest()
+    if down_mbit:
+        print(f"下载: {down_mbit:.1f} Mbit/s")
+    else:
+        print("下载: 测速失败")
+    if up_mbit:
+        print(f"上传: {up_mbit:.1f} Mbit/s")
+    else:
+        print("上传: 测速失败")
+    print()
+    print("说明：这套脚本的 tc 限速管的是『出口』方向（这台机器往外发数据），")
+    print("对应的是上面的『上传』这个数字，不是『下载』。")
+    print("这只是单次到 Cloudflare 一个节点的粗略测速，比网卡自称的速率更接近真实，")
+    print("但不如找你自己的真实业务 peer 用 iperf3 测得准，仅供参考。")
+
+
+def detect_established_connections():
+    """探测当前 established 状态的 TCP 连接数，用来判断这台机器是不是高并发中转/落地机。
+    探测失败返回 None。"""
+    out = run("ss -tan state established 2>/dev/null | wc -l", check=False).strip()
+    try:
+        n = int(out)
+        return max(0, n - 1)  # ss 输出第一行是表头（用 state established 过滤后可能没有表头，这里做个保守扣减）
+    except ValueError:
+        return None
+
+
+def pick_profile_by_concurrency(established):
+    """根据并发连接数，自动挑一套 (interval, retrans_pct_threshold, min_pct, max_pct)。
+    并发越高，说明这是台真实在扛大量用户流量的中转/落地机：
+      - 判断周期要拉长，避免被瞬时流量突刺频繁打断（对应之前手动调过的 15s 那次）
+      - 重传率阈值适当收紧，因为高并发下小比例的真实重传更值得警惕
+      - min/max 占比可以更激进一点贴近真实带宽上限
+    并发低的机器（个人小站、测试机）用更保守、更快响应的默认值。"""
+    if established is None:
+        # 探测不到就用中等保守的通用默认值
+        return dict(interval=8.0, retrans_pct_threshold=2.0, min_pct=0.5, max_pct=0.9, label="未知（默认档）")
+    if established >= 500:
+        return dict(interval=20.0, retrans_pct_threshold=1.5, min_pct=0.6, max_pct=0.9, label=f"高并发（{established} 个连接）")
+    if established >= 50:
+        return dict(interval=10.0, retrans_pct_threshold=2.0, min_pct=0.55, max_pct=0.9, label=f"中等并发（{established} 个连接）")
+    return dict(interval=8.0, retrans_pct_threshold=2.0, min_pct=0.5, max_pct=0.85, label=f"低并发（{established} 个连接）")
+
+
 def htb_class_exists(iface, classid):
     out = run(f"tc class show dev {iface} classid {classid}", check=False)
     return bool(out.strip())
@@ -474,6 +555,47 @@ def get_tcp_retrans_total():
     return retrans
 
 
+# --------------------------------------------------------------------------
+# CPU / 软中断占用监控（判断瓶颈是不是压根不在网络路径上，而是这台机器算力扛不住了）
+# --------------------------------------------------------------------------
+
+def get_cpu_times():
+    """读 /proc/stat 第一行（所有核心汇总），返回累计 jiffies 的字典。
+    返回的是『累计值』，跟 drop/retrans 一样需要调用方自己做前后两次采样的差值，
+    读取失败返回 None。"""
+    try:
+        with open("/proc/stat") as f:
+            line = f.readline()
+    except OSError:
+        return None
+    parts = line.split()
+    if not parts or parts[0] != "cpu":
+        return None
+    try:
+        vals = [int(x) for x in parts[1:11]]
+    except ValueError:
+        return None
+    while len(vals) < 10:
+        vals.append(0)
+    user, nice, system, idle, iowait, irq, softirq, steal = vals[:8]
+    total = user + nice + system + idle + iowait + irq + softirq + steal
+    busy = total - idle - iowait
+    return {"total": total, "busy": busy, "softirq": softirq}
+
+
+def compute_cpu_pct(cpu_before, cpu_after):
+    """根据前后两次 get_cpu_times() 采样，算出这段时间内的『总体繁忙占比』和『软中断占比』（百分比）。
+    任一采样缺失或时间没走，返回 (0.0, 0.0)（不误判为异常，避免因为读取失败反而触发降速）。"""
+    if not cpu_before or not cpu_after:
+        return 0.0, 0.0
+    total_delta = cpu_after["total"] - cpu_before["total"]
+    if total_delta <= 0:
+        return 0.0, 0.0
+    busy_pct = (cpu_after["busy"] - cpu_before["busy"]) / total_delta * 100
+    softirq_pct = (cpu_after["softirq"] - cpu_before["softirq"]) / total_delta * 100
+    return max(0.0, busy_pct), max(0.0, softirq_pct)
+
+
 def get_class_current_rate(iface, classid):
     out = run(f"tc class show dev {iface} classid {classid}", check=False)
     m = re.search(r"ceil\s+(\S+)", out)
@@ -530,6 +652,8 @@ def cmd_tune(args):
     down_step = float(pick(args.down_step, "DOWN_STEP", 0.15, float))
     retrans_pct_threshold = float(pick(args.retrans_pct_threshold, "RETRANS_PCT_THRESHOLD", 2.0, float))
     drop_threshold = int(pick(args.drop_threshold, "DROP_THRESHOLD", 1, int))
+    cpu_pct_threshold = float(pick(args.cpu_pct_threshold, "CPU_PCT_THRESHOLD", 90.0, float))
+    softirq_pct_threshold = float(pick(args.softirq_pct_threshold, "SOFTIRQ_PCT_THRESHOLD", 30.0, float))
     apply_flag = args.apply or (env.get("APPLY", "false").lower() == "true")
 
     for name, val in [("iface", iface), ("classid", classid), ("min_rate", min_rate), ("max_ceil", max_ceil)]:
@@ -555,14 +679,15 @@ def cmd_tune(args):
 
     logging.info(
         "启动 AIMD 调优 | iface=%s classid=%s 起点=%s 范围=[%s, %s] 周期=%ss "
-        "重传率阈值=%.2f%% 模式=%s",
+        "重传率阈值=%.2f%% CPU阈值=%.0f%% 软中断阈值=%.0f%% 模式=%s",
         iface, classid, bps_to_rate_str(current), min_rate, max_ceil, interval,
-        retrans_pct_threshold,
+        retrans_pct_threshold, cpu_pct_threshold, softirq_pct_threshold,
         "APPLY" if apply_flag else "DRY-RUN（不会下发配置）",
     )
 
     last_drops = get_qdisc_drops(iface)
     last_retrans, last_outsegs = get_tcp_stats()
+    last_cpu = get_cpu_times()
     iteration = 0
 
     try:
@@ -572,6 +697,7 @@ def cmd_tune(args):
 
             drops_now = get_qdisc_drops(iface)
             retrans_now, outsegs_now = get_tcp_stats()
+            cpu_now = get_cpu_times()
 
             drop_delta = drops_now - last_drops
 
@@ -591,27 +717,41 @@ def cmd_tune(args):
             else:
                 retrans_pct = 0.0
 
-            anomaly = (drop_delta > drop_threshold) or (retrans_pct > retrans_pct_threshold)
+            cpu_pct, softirq_pct = compute_cpu_pct(last_cpu, cpu_now)
+
+            # 网络指标正常不代表可以继续加速：如果这台机器整体 CPU 或者软中断
+            # （处理网卡收发中断/转发的那部分开销）已经顶到阈值，说明瓶颈根本不在
+            # 网络路径上，而是算力扛不住了，继续升速只会让延迟和丢包变得更差。
+            cpu_saturated = (cpu_pct > cpu_pct_threshold) or (softirq_pct > softirq_pct_threshold)
+
+            anomaly = (drop_delta > drop_threshold) or (retrans_pct > retrans_pct_threshold) or cpu_saturated
 
             if anomaly:
                 new_rate = max(min_bps, current * (1 - down_step))
+                reason = []
+                if drop_delta > drop_threshold:
+                    reason.append(f"drop+{drop_delta}")
+                if retrans_pct > retrans_pct_threshold:
+                    reason.append(f"重传率={retrans_pct:.2f}%")
+                if cpu_saturated:
+                    reason.append(f"CPU={cpu_pct:.0f}%/软中断={softirq_pct:.0f}%")
                 logging.info(
-                    "[周期 %d] 异常: drop+%d 重传率=%.2f%%(retrans+%d/out+%d) -> 下调 %s -> %s",
-                    iteration, drop_delta, retrans_pct, retrans_delta, outsegs_delta,
+                    "[周期 %d] 异常: %s -> 下调 %s -> %s",
+                    iteration, " ".join(reason),
                     bps_to_rate_str(current), bps_to_rate_str(new_rate),
                 )
             else:
                 new_rate = min(max_bps, current * (1 + up_step))
                 if new_rate != current:
                     logging.info(
-                        "[周期 %d] 正常: drop+%d 重传率=%.2f%%(retrans+%d/out+%d) -> 上调 %s -> %s",
-                        iteration, drop_delta, retrans_pct, retrans_delta, outsegs_delta,
+                        "[周期 %d] 正常: drop+%d 重传率=%.2f%% CPU=%.0f%%/软中断=%.0f%% -> 上调 %s -> %s",
+                        iteration, drop_delta, retrans_pct, cpu_pct, softirq_pct,
                         bps_to_rate_str(current), bps_to_rate_str(new_rate),
                     )
                 else:
                     logging.info(
-                        "[周期 %d] 正常，已在上限 %s，保持不变（重传率=%.2f%%）",
-                        iteration, bps_to_rate_str(current), retrans_pct,
+                        "[周期 %d] 正常，已在上限 %s，保持不变（重传率=%.2f%% CPU=%.0f%%/软中断=%.0f%%）",
+                        iteration, bps_to_rate_str(current), retrans_pct, cpu_pct, softirq_pct,
                     )
 
             if abs(new_rate - current) / current > 0.005:
@@ -621,6 +761,7 @@ def cmd_tune(args):
             last_drops = drops_now
             last_retrans = retrans_now if retrans_now is not None else last_retrans
             last_outsegs = outsegs_now if outsegs_now is not None else last_outsegs
+            last_cpu = cpu_now if cpu_now is not None else last_cpu
 
             if args.max_iterations and iteration >= args.max_iterations:
                 logging.info("达到 --max-iterations=%d，退出", args.max_iterations)
@@ -723,8 +864,21 @@ def cmd_install_service(args):
 
 
 def cmd_auto(args):
-    """全自动：探测网卡/带宽 -> 建 htb 拓扑 -> 开 BBR -> 写配置(APPLY=true) -> 装+启动 systemd。
-    全程不需要手动确认，适合『一条 curl 命令跑完』的场景。"""
+    """全自动：探测网卡/带宽/并发连接数 -> 按画像自动挑参数 -> 建 htb 拓扑 -> 开 BBR -> 写配置(APPLY=true) -> 装+启动 systemd。
+    全程不需要手动确认，也不需要手动传参数，适合『一条 curl 命令跑完』的场景。
+
+    以下参数如果不传，会根据探测到的并发连接数自动挑一套合适的值；传了就以传的为准：
+      --min-pct / --max-pct       min-rate / max-ceil 占探测到的链路速率的比例
+      --interval                  判断周期（秒）
+      --retrans-pct-threshold     判定异常的重传率阈值（百分比）
+    以下几个目前没有自动画像，用固定默认值，传了才会变：
+      --up-step / --down-step     AIMD 每周期涨跌的比例
+      --drop-threshold            判定异常的单周期 qdisc drop 数量阈值
+      --cpu-pct-threshold          CPU 总体繁忙占比异常阈值
+      --softirq-pct-threshold      软中断占比异常阈值
+    带宽探测顺序：--link-mbit 手动指定 > 网卡自报速率(ethtool/sysfs) > 实测测速(Cloudflare) > 保守默认值 1000。
+    可以用 --no-speedtest 关掉最后那步实测（比如批量部署很多台机器时不想每台都跑一次测速）。
+    """
     require_root()
 
     logging.info("===== 全自动模式：以下所有变更会直接生效，不再逐步确认 =====")
@@ -736,23 +890,52 @@ def cmd_auto(args):
         sys.exit(1)
     logging.info("使用网卡: %s", iface)
 
-    # 2. 探测链路速率，探测不到就用保守默认值
+    # 2. 探测链路速率：手动指定 > 网卡自报 > 实测测速 > 保守默认值
     speed_mbit = args.link_mbit or detect_link_speed_mbit(iface)
+    if speed_mbit:
+        logging.info("探测到链路速率: %smbit", speed_mbit)
+    elif not args.no_speedtest:
+        logging.info("网卡没有上报真实速率（虚拟网卡常见），尝试实测一次（会消耗一些流量，耗时数秒到十几秒）...")
+        down_mbit, up_mbit = run_speedtest()
+        if up_mbit:
+            speed_mbit = int(up_mbit)
+            logging.info(
+                "实测完成: 上传≈%.1fmbit 下载≈%.1fmbit（出口限速用上传值作参考，仅供参考不是权威真实带宽）",
+                up_mbit, down_mbit or 0,
+            )
+        else:
+            logging.warning("实测也失败了（可能是这台机器出不了公网，或者被墙），退回保守默认值")
+
     if not speed_mbit:
         speed_mbit = 1000
-        logging.warning(
-            "无法探测 %s 的真实链路速率（云厂商虚拟网卡常见），"
-            "使用保守默认值 %smbit。如果你清楚实际带宽，用 --link-mbit 指定更准确。",
-            iface, speed_mbit,
-        )
-    else:
-        logging.info("探测到链路速率: %smbit", speed_mbit)
+        logging.warning("最终没能测出真实速率，使用保守默认值 %smbit。可以用 --link-mbit 手动指定更准确的值。", speed_mbit)
 
     classid = args.classid or "1:10"
-    min_rate_mbit = max(10, int(speed_mbit * 0.5))
-    max_ceil_mbit = max(min_rate_mbit + 10, int(speed_mbit * 0.9))
-    logging.info("自动计算范围: min-rate=%smbit max-ceil=%smbit（链路速率的 50%%~90%%）",
-                 min_rate_mbit, max_ceil_mbit)
+
+    # 自动探测并发连接数，据此挑一套合适的默认参数（用户显式传的参数优先级更高，不会被覆盖）
+    established = detect_established_connections()
+    profile = pick_profile_by_concurrency(established)
+    logging.info("探测到机器画像: %s -> 建议参数 interval=%ss retrans_pct_threshold=%s%% min_pct=%s max_pct=%s",
+                 profile["label"], profile["interval"], profile["retrans_pct_threshold"],
+                 profile["min_pct"], profile["max_pct"])
+
+    min_pct = args.min_pct if args.min_pct is not None else profile["min_pct"]
+    max_pct = args.max_pct if args.max_pct is not None else profile["max_pct"]
+    min_rate_mbit = max(10, int(speed_mbit * min_pct))
+    max_ceil_mbit = max(min_rate_mbit + 10, int(speed_mbit * max_pct))
+    logging.info("自动计算范围: min-rate=%smbit(%.0f%%) max-ceil=%smbit(%.0f%%)",
+                 min_rate_mbit, min_pct * 100, max_ceil_mbit, max_pct * 100)
+
+    interval = args.interval if args.interval is not None else profile["interval"]
+    up_step = args.up_step if args.up_step is not None else 0.05
+    down_step = args.down_step if args.down_step is not None else 0.15
+    retrans_pct_threshold = (
+        args.retrans_pct_threshold if args.retrans_pct_threshold is not None
+        else profile["retrans_pct_threshold"]
+    )
+    drop_threshold = args.drop_threshold if args.drop_threshold is not None else 1
+    cpu_pct_threshold = args.cpu_pct_threshold if args.cpu_pct_threshold is not None else 90.0
+    softirq_pct_threshold = args.softirq_pct_threshold if args.softirq_pct_threshold is not None else 30.0
 
     # 3. 建 htb 拓扑（已存在则跳过）
     ensure_htb_setup(iface, classid, min_rate_mbit, max_ceil_mbit, apply=True)
@@ -766,11 +949,13 @@ def cmd_auto(args):
         f"CLASSID={classid}\n"
         f"MIN_RATE={min_rate_mbit}mbit\n"
         f"MAX_CEIL={max_ceil_mbit}mbit\n"
-        f"INTERVAL=8\n"
-        f"UP_STEP=0.05\n"
-        f"DOWN_STEP=0.15\n"
-        f"RETRANS_PCT_THRESHOLD=2.0\n"
-        f"DROP_THRESHOLD=1\n"
+        f"INTERVAL={interval}\n"
+        f"UP_STEP={up_step}\n"
+        f"DOWN_STEP={down_step}\n"
+        f"RETRANS_PCT_THRESHOLD={retrans_pct_threshold}\n"
+        f"DROP_THRESHOLD={drop_threshold}\n"
+        f"CPU_PCT_THRESHOLD={cpu_pct_threshold}\n"
+        f"SOFTIRQ_PCT_THRESHOLD={softirq_pct_threshold}\n"
         f"APPLY=true\n"
     )
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -860,7 +1045,14 @@ def run_menu():
         choice = raw.strip() or "1"
 
     if choice == "1":
-        cmd_auto(argparse.Namespace(iface=None, classid=None, link_mbit=None))
+        cmd_auto(argparse.Namespace(
+            iface=None, classid=None, link_mbit=None,
+            min_pct=None, max_pct=None, interval=None,
+            up_step=None, down_step=None,
+            retrans_pct_threshold=None, drop_threshold=None,
+            cpu_pct_threshold=None, softirq_pct_threshold=None,
+            no_speedtest=False,
+        ))
     elif choice == "2":
         cmd_check(argparse.Namespace(iface=None, classid=None))
     elif choice == "3":
@@ -897,6 +1089,10 @@ def main():
     p_tune.add_argument("--retrans-pct-threshold", dest="retrans_pct_threshold", type=float,
                          help="重传率超过这个百分比视为异常，默认 2.0（即 2%%）")
     p_tune.add_argument("--drop-threshold", dest="drop_threshold", type=int)
+    p_tune.add_argument("--cpu-pct-threshold", dest="cpu_pct_threshold", type=float,
+                         help="CPU 总体繁忙占比异常阈值(%%)，默认 90")
+    p_tune.add_argument("--softirq-pct-threshold", dest="softirq_pct_threshold", type=float,
+                         help="软中断占比异常阈值(%%)，默认 30")
     p_tune.add_argument("--apply", action="store_true", help="真正下发 tc 命令；不加则只打印计划")
     p_tune.add_argument("--env-file", dest="env_file", help="从配置文件读取参数（CLI 参数优先级更高）")
     p_tune.add_argument("--max-iterations", dest="max_iterations", type=int, default=0)
@@ -910,7 +1106,28 @@ def main():
     p_auto.add_argument("--classid", help="手动指定 classid，默认 1:10")
     p_auto.add_argument("--link-mbit", dest="link_mbit", type=int,
                          help="手动指定链路速率(Mbit)，不给则尝试自动探测，探测不到则用保守默认值 1000")
+    p_auto.add_argument("--min-pct", dest="min_pct", type=float,
+                         help="min-rate 占链路速率的比例，不给则按探测到的并发连接数自动挑（低并发 0.5，高并发 0.6）")
+    p_auto.add_argument("--max-pct", dest="max_pct", type=float,
+                         help="max-ceil 占链路速率的比例，不给则按并发自动挑（低并发 0.85，中高并发 0.9）")
+    p_auto.add_argument("--interval", type=float,
+                         help="判断周期（秒），不给则按并发自动挑（低并发 8s，中并发 10s，高并发 20s）")
+    p_auto.add_argument("--up-step", dest="up_step", type=float, help="无异常时每周期上调比例，默认 0.05")
+    p_auto.add_argument("--down-step", dest="down_step", type=float, help="异常时每周期下调比例，默认 0.15")
+    p_auto.add_argument("--retrans-pct-threshold", dest="retrans_pct_threshold", type=float,
+                         help="重传率异常阈值(%%)，不给则按并发自动挑（低/中并发 2.0，高并发 1.5）")
+    p_auto.add_argument("--drop-threshold", dest="drop_threshold", type=int,
+                         help="单周期 qdisc drop 异常阈值，默认 1")
+    p_auto.add_argument("--cpu-pct-threshold", dest="cpu_pct_threshold", type=float,
+                         help="CPU 总体繁忙占比异常阈值(%%)，默认 90")
+    p_auto.add_argument("--softirq-pct-threshold", dest="softirq_pct_threshold", type=float,
+                         help="软中断占比异常阈值(%%)，默认 30")
+    p_auto.add_argument("--no-speedtest", dest="no_speedtest", action="store_true",
+                         help="网卡探测不到真实速率时，不要额外做一次实测（默认会做）")
     p_auto.set_defaults(func=cmd_auto)
+
+    p_speedtest = sub.add_parser("speedtest", help="单独测一次上传/下载速度（用 Cloudflare 节点，不需要你自己准备对端）")
+    p_speedtest.set_defaults(func=cmd_speedtest)
 
     p_uninstall = sub.add_parser("uninstall", help="卸载 systemd 服务和安装的文件")
     p_uninstall.add_argument("--purge-config", action="store_true", help="连配置文件一起删除")
@@ -930,6 +1147,5 @@ if __name__ == "__main__":
     main()
 
 PYEOF
-
 chmod +x "$PY_PATH"
 exec python3 "$PY_PATH" "$@"
