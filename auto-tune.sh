@@ -53,6 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -71,6 +72,9 @@ STATE_PATH = f"{CONFIG_DIR}/last-known-speed.mbit"
 SERVICE_PATH = "/etc/systemd/system/auto-tune.service"
 SYSCTL_BACKUP_DIR = "/etc/auto-tune/sysctl-backup"
 SYSCTL_TUNE_FILE = "/etc/sysctl.d/99-auto-tune.conf"
+# 用独立文件名，避免跟网上一些同样叫 99-auto-tune.conf 的第三方脚本互相覆盖
+SYSCTL_EXTRA_FILE = "/etc/sysctl.d/98-auto-tune-extra.conf"
+MODULES_LOAD_FILE = "/etc/modules-load.d/auto-tune-nf-conntrack.conf"
 
 # 通过 `curl ... | python3 - auto` 管道方式运行时，脚本自身没有本地文件路径可复制，
 # 需要重新从这个地址下载一份落盘到 INSTALL_DIR，供 systemd service 长期引用。
@@ -328,6 +332,101 @@ def cmd_enable_bbr(args):
 
 
 # --------------------------------------------------------------------------
+# TCP buffer / conntrack / 其它常规 sysctl 调优（跟 BBR 分开管理，写不同的文件，
+# 不互相覆盖，也方便你只想要其中一项时单独开关）
+# --------------------------------------------------------------------------
+
+def compute_buffer_bytes(speed_mbit):
+    """按链路速率分档给 TCP 读写 buffer 定一个合理上限。
+    档位越高不代表越好——buffer 太大在丢包网络里反而会加剧 bufferbloat（排队延迟），
+    这里给的是常见的保守分档，不是越大越好。"""
+    if speed_mbit is None or speed_mbit < 100:
+        return 16 * 1024 * 1024   # 16MB
+    if speed_mbit < 500:
+        return 32 * 1024 * 1024   # 32MB
+    return 64 * 1024 * 1024       # 64MB
+
+
+def compute_conntrack_max(established):
+    """按当前并发连接数分档给 conntrack 表定大小，而不是按带宽——
+    conntrack 表满了会导致新连接建不起来，这个跟带宽大小没有直接关系，
+    只跟『同时有多少条连接』有关，所以用 detect_established_connections() 的结果来定更合理。"""
+    if established is None:
+        return 262144
+    if established >= 1000:
+        return 1048576
+    if established >= 200:
+        return 524288
+    return 262144
+
+
+def do_tune_sysctl(apply, speed_mbit=None, established=None):
+    """写 TCP buffer / conntrack / 常规网络参数，跟 BBR 是分开的独立文件（SYSCTL_EXTRA_FILE），
+    不会覆盖 do_enable_bbr 写的那个文件，两者可以独立开关。"""
+    buffer_bytes = compute_buffer_bytes(speed_mbit)
+    conntrack_max = compute_conntrack_max(established)
+
+    lines = [
+        f"net.core.rmem_max = {buffer_bytes}",
+        f"net.core.wmem_max = {buffer_bytes}",
+        f"net.ipv4.tcp_rmem = 4096 87380 {buffer_bytes}",
+        f"net.ipv4.tcp_wmem = 4096 87380 {buffer_bytes}",
+        "net.ipv4.tcp_fastopen = 3",
+        "net.ipv4.tcp_mtu_probing = 1",
+        "net.ipv4.tcp_tw_reuse = 1",
+        "net.ipv4.tcp_fin_timeout = 15",
+        "net.ipv4.tcp_keepalive_time = 300",
+        "net.ipv4.ip_local_port_range = 1024 65535",
+        "net.core.somaxconn = 65535",
+        "net.core.netdev_max_backlog = 4096",
+        f"net.netfilter.nf_conntrack_max = {conntrack_max}",
+    ]
+
+    logging.info(
+        "计划写入 %s（buffer=%s字节 conntrack_max=%s，依据：speed=%smbit established=%s）：\n  %s",
+        SYSCTL_EXTRA_FILE, buffer_bytes, conntrack_max, speed_mbit, established,
+        "\n  ".join(lines),
+    )
+
+    if not apply:
+        logging.info("[dry-run] 未加 --apply，不会真正写入。确认无误后加 --apply 执行。")
+        return False
+
+    backup_sysctl()
+
+    # nf_conntrack 内核模块要先加载，sysctl 才认识 net.netfilter.nf_conntrack_max 这个键；
+    # 用 modules-load.d 持久化，重启也会自动加载，不用 legacy 的 /etc/modules 追加写法
+    run("modprobe nf_conntrack", check=False)
+    try:
+        with open(MODULES_LOAD_FILE, "w") as f:
+            f.write("nf_conntrack\n")
+    except OSError as e:
+        logging.warning("写 %s 失败: %s（不影响本次生效，只影响重启后是否自动加载模块）", MODULES_LOAD_FILE, e)
+
+    with open(SYSCTL_EXTRA_FILE, "w") as f:
+        f.write("# 由 auto-tune.py tune-sysctl 写入\n")
+        f.write("\n".join(lines) + "\n")
+    run("sysctl --system")
+
+    logging.info("已写入并生效 %s", SYSCTL_EXTRA_FILE)
+    return True
+
+
+def cmd_tune_sysctl(args):
+    require_root()
+    speed_mbit = args.speed_mbit
+    if speed_mbit is None:
+        speed_mbit = read_last_known_speed()
+        if speed_mbit:
+            logging.info("未指定 --speed-mbit，使用历史记录里的 %smbit", speed_mbit)
+        else:
+            logging.info("未指定 --speed-mbit，也没有历史记录，按 <100mbit 档位处理（更保守的 buffer）")
+    established = detect_established_connections()
+    logging.info("探测到并发连接数: %s", established)
+    do_tune_sysctl(args.apply, speed_mbit=speed_mbit, established=established)
+
+
+# --------------------------------------------------------------------------
 # 自动探测：网卡 / 链路速率 / 建 htb 拓扑（供 `auto` 全自动子命令使用）
 # --------------------------------------------------------------------------
 
@@ -358,43 +457,95 @@ def detect_link_speed_mbit(iface):
     return None
 
 
-def run_speedtest(download_bytes=30_000_000, upload_bytes=15_000_000, timeout=25):
-    """用 Cloudflare 公开的测速接口做一次真实的上传/下载测速，不需要你自己准备对端机器。
+def ensure_ookla_speedtest_installed():
+    """检查 Ookla 官方 Speedtest CLI（命令名叫 speedtest）是否已装，没有就自动装。
+
+    注意：不是同名的 speedtest-cli（sivel 写的那个第三方开源工具）——那个项目已经在
+    2026年1月被作者归档、停止维护，而且在较新的系统上有已知的『测出来永远是0』的
+    坏结果，所以这里特意换成 Ookla 自己出的、持续维护的官方版本，命令名是 `speedtest`
+    不是 `speedtest-cli`。"""
+    def is_official_ookla():
+        if not shutil.which("speedtest"):
+            return False
+        out = run("speedtest --version", check=False, timeout=15)
+        return "ookla" in (out or "").lower()
+
+    if is_official_ookla():
+        return True
+
+    logging.info("未检测到 Ookla 官方 Speedtest CLI，尝试自动安装...")
+
+    # 先移除可能冲突的旧版第三方 speedtest-cli（已归档不维护，装了反而可能干扰）
+    run("apt-get remove -y speedtest-cli", check=False, timeout=30)
+
+    # Debian/Ubuntu 系：加官方仓库再装
+    run(
+        "curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash",
+        check=False, timeout=60,
+    )
+    list_path = "/etc/apt/sources.list.d/ookla_speedtest-cli.list"
+    if os.path.exists(list_path):
+        # Ookla 的仓库脚本有时候还没跟上最新的 Ubuntu 代号（比如 24.04 的 noble），
+        # 兼容处理成用已知支持的 jammy(22.04) 源，装的包本身没问题
+        run(f"sed -i 's/noble/jammy/g; s/plucky/jammy/g; s/oracular/jammy/g' {list_path}", check=False)
+        run("apt-get update -y", check=False, timeout=60)
+    run("apt-get install -y speedtest", check=False, timeout=60)
+    if is_official_ookla():
+        return True
+
+    # RHEL/CentOS 系兜底
+    run(
+        "curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash",
+        check=False, timeout=60,
+    )
+    run("yum install -y speedtest", check=False, timeout=60)
+    if is_official_ookla():
+        return True
+    run("dnf install -y speedtest", check=False, timeout=60)
+
+    return is_official_ookla()
+
+
+def run_speedtest(timeout=60):
+    """用 Ookla 官方 Speedtest CLI 做一次真实的上传/下载测速。
+    不需要你自己准备对端机器，它会自己在全球节点里选一个测。
     返回 (down_mbit, up_mbit)，任一项测不出来就是 None。
 
-    注意：这只是单次、单一路径（到 Cloudflare 边缘节点）的粗略测速，跟文章里强调的
-    "不要拿单一 peer 的数字当全局真相"是同一个道理——能比"网卡自称的速率"更接近真实，
-    但仍然不如你自己找真实业务 peer 用 iperf3 测得准。"""
+    注意：这仍然只是单次、单条连接的测速，跟文章里强调的"不要拿单一 peer 的数字当
+    全局真相"是同一个道理——换成官方 Ookla CLI 能避开一些第三方工具的兼容性/连通性
+    问题，但测不准的根本原因（这台机器同时有大量真实流量在抢带宽/CPU）换哪个测速
+    服务都一样存在，不会因为换了工具就自动解决。"""
+    if not ensure_ookla_speedtest_installed():
+        logging.warning("Ookla Speedtest CLI 安装失败，无法测速（检查网络能不能访问包源）")
+        return None, None
+
+    # --accept-license --accept-gdpr 是必须的：第一次跑官方 CLI 默认会交互式提示你
+    # 输入 YES 接受协议，脚本化场景下没有交互输入会直接卡住，加这两个参数跳过确认。
+    # -f json 用机器可读格式，比解析人类可读文本更可靠。
+    out = run(
+        f"speedtest --accept-license --accept-gdpr -f json --timeout {timeout}",
+        check=False, timeout=timeout + 15,
+    )
+    if not out:
+        logging.warning("Speedtest CLI 没有返回任何结果（可能是找不到可用的测速节点，或超时）")
+        return None, None
+
+    try:
+        data = json.loads(out)
+    except (ValueError, json.JSONDecodeError):
+        logging.warning("Speedtest CLI 输出不是合法 JSON，原始输出：\n%s", out.strip())
+        return None, None
+
     down_mbit, up_mbit = None, None
+    down_bw = (data.get("download") or {}).get("bandwidth")
+    up_bw = (data.get("upload") or {}).get("bandwidth")
+    if down_bw:
+        down_mbit = down_bw * 8 / 1_000_000  # Ookla JSON 单位是 字节/秒
+    if up_bw:
+        up_mbit = up_bw * 8 / 1_000_000
 
-    try:
-        t0 = time.time()
-        out = run(
-            f'curl -o /dev/null -s -w "%{{size_download}}" '
-            f'"https://speed.cloudflare.com/__down?bytes={download_bytes}" '
-            f'--max-time {timeout}',
-            check=False, timeout=timeout + 5,
-        )
-        elapsed = time.time() - t0
-        downloaded = int((out or "0").strip() or 0)
-        if downloaded > 1_000_000 and elapsed > 0.3:
-            down_mbit = (downloaded * 8) / elapsed / 1_000_000
-    except Exception as e:
-        logging.warning("下载测速失败: %s", e)
-
-    try:
-        t0 = time.time()
-        out = run(
-            f'head -c {upload_bytes} /dev/urandom | curl -X POST --data-binary @- -s '
-            f'-w "%{{size_upload}}" "https://speed.cloudflare.com/__up" --max-time {timeout}',
-            check=False, timeout=timeout + 5,
-        )
-        elapsed = time.time() - t0
-        uploaded = int((out or "0").strip() or 0)
-        if uploaded > 1_000_000 and elapsed > 0.3:
-            up_mbit = (uploaded * 8) / elapsed / 1_000_000
-    except Exception as e:
-        logging.warning("上传测速失败: %s", e)
+    if down_mbit is None and up_mbit is None:
+        logging.warning("Speedtest CLI 结果里 download/upload 字段都是空，原始输出：\n%s", out.strip())
 
     return down_mbit, up_mbit
 
@@ -421,7 +572,7 @@ def write_last_known_speed(mbit):
 
 
 def cmd_speedtest(args):
-    logging.info("开始测速（用 Cloudflare 边缘节点，会消耗一些流量，耗时数秒到十几秒）...")
+    logging.info("开始测速（用 Ookla Speedtest CLI，会消耗一些流量，耗时数秒到十几秒）...")
     down_mbit, up_mbit = run_speedtest()
     if down_mbit:
         print(f"下载: {down_mbit:.1f} Mbit/s")
@@ -434,7 +585,7 @@ def cmd_speedtest(args):
     print()
     print("说明：这套脚本的 tc 限速管的是『出口』方向（这台机器往外发数据），")
     print("对应的是上面的『上传』这个数字，不是『下载』。")
-    print("这只是单次到 Cloudflare 一个节点的粗略测速，比网卡自称的速率更接近真实，")
+    print("这只是单次、单条连接的粗略测速，比网卡自称的速率更接近真实，")
     print("但不如找你自己的真实业务 peer 用 iperf3 测得准，仅供参考。")
 
 
@@ -955,8 +1106,10 @@ def cmd_auto(args):
       --drop-threshold            判定异常的单周期 qdisc drop 数量阈值
       --cpu-pct-threshold          CPU 总体繁忙占比异常阈值
       --softirq-pct-threshold      软中断占比异常阈值
-    带宽探测顺序：--link-mbit 手动指定 > 网卡自报速率(ethtool/sysfs) > 实测测速(Cloudflare) > 保守默认值 1000。
-    可以用 --no-speedtest 关掉最后那步实测（比如批量部署很多台机器时不想每台都跑一次测速）。
+    带宽探测顺序：--link-mbit 手动指定 > 网卡自报速率(ethtool/sysfs) > 历史记录 > 保守默认值 1000。
+    实测测速(Ookla Speedtest CLI)默认不再自动跑——
+    在某些网络环境下这条路本身就不通/不稳定，而且高并发环境下测出来的数字也常常不准，
+    与其自动跑一个不可靠的测速，不如默认不跑，交给你自己判断要不要用 --try-speedtest 显式开启。
     """
     require_root()
 
@@ -975,16 +1128,17 @@ def cmd_auto(args):
     established = detect_established_connections()
     profile = pick_profile_by_concurrency(established)
     speedtest_unsafe = established is not None and established >= 500
+    want_speedtest = args.try_speedtest or args.force_speedtest  # 显式要求才会真的去跑 speedtest
 
-    # 2. 探测链路速率：手动指定 > 网卡自报 > 实测测速（有历史记录做理智检查）> 历史记录 > 保守默认值
+    # 2. 探测链路速率：手动指定 > 网卡自报 > 实测测速（默认关闭，显式开启才做，有历史记录做理智检查）> 历史记录 > 保守默认值
     last_known = read_last_known_speed()
     speed_mbit = args.link_mbit or detect_link_speed_mbit(iface)
     trust_this_value = bool(speed_mbit)  # 手动指定/网卡自报的值直接信
 
     if speed_mbit:
         logging.info("探测到链路速率: %smbit", speed_mbit)
-    elif args.no_speedtest:
-        pass
+    elif not want_speedtest:
+        logging.info("未指定 --link-mbit，也没有开启实测测速（默认不跑，加 --try-speedtest 才会试）")
     elif speedtest_unsafe and not args.force_speedtest:
         logging.warning(
             "当前有 %d 个建立态连接，属于高并发机器——这个时候测速大概率会被真实流量"
@@ -993,7 +1147,7 @@ def cmd_auto(args):
             established,
         )
     else:
-        logging.info("网卡没有上报真实速率（虚拟网卡常见），尝试实测一次（会消耗一些流量，耗时数秒到十几秒）...")
+        logging.info("尝试实测一次（用 Ookla Speedtest CLI，会消耗一些流量，耗时数秒到十几秒）...")
         down_mbit, up_mbit = run_speedtest()
         if up_mbit:
             candidate = int(up_mbit)
@@ -1017,7 +1171,10 @@ def cmd_auto(args):
                 speed_mbit = candidate
                 trust_this_value = True
         else:
-            logging.warning("实测也失败了（可能是这台机器出不了公网，或者被墙）")
+            logging.warning(
+                "实测失败（Speedtest CLI 没找到能连上的测速节点，可能是这台机器出不了公网、"
+                "被墙、或者这条路径本身就不通），不采信任何结果"
+            )
 
     if not speed_mbit and last_known:
         speed_mbit = int(last_known)
@@ -1060,8 +1217,10 @@ def cmd_auto(args):
     # 3. 建 htb 拓扑（已存在则跳过）
     ensure_htb_setup(iface, classid, min_rate_mbit, max_ceil_mbit, apply=True)
 
-    # 4. 开 BBR
+    # 4. 开 BBR + TCP buffer/conntrack 常规调优（各自写独立文件，互不覆盖）
     do_enable_bbr(apply=True)
+    if not args.no_sysctl_tune:
+        do_tune_sysctl(apply=True, speed_mbit=speed_mbit, established=established)
 
     # 5. 写配置文件（直接 APPLY=true，全自动模式不留 dry-run 缓冲）
     env_content = (
@@ -1222,7 +1381,7 @@ def run_menu():
             up_step=None, down_step=None,
             retrans_pct_threshold=None, drop_threshold=None,
             cpu_pct_threshold=None, softirq_pct_threshold=None,
-            no_speedtest=False, force_speedtest=False, max_only=False,
+            no_speedtest=False, force_speedtest=False, max_only=False, no_sysctl_tune=False, try_speedtest=False,
         ))
     elif choice == "2":
         cmd_check(argparse.Namespace(iface=None, classid=None))
@@ -1248,6 +1407,12 @@ def main():
     p_bbr = sub.add_parser("enable-bbr", help="开启 BBR + fq")
     p_bbr.add_argument("--apply", action="store_true", help="真正写入并生效；不加则只打印计划")
     p_bbr.set_defaults(func=cmd_enable_bbr)
+
+    p_sysctl = sub.add_parser("tune-sysctl", help="调 TCP buffer / conntrack 表大小 / 常规网络参数（跟 BBR 分开管理）")
+    p_sysctl.add_argument("--speed-mbit", dest="speed_mbit", type=int,
+                           help="按这个链路速率决定 buffer 大小，不给则用历史记录，都没有则按保守档位处理")
+    p_sysctl.add_argument("--apply", action="store_true", help="真正写入并生效；不加则只打印计划")
+    p_sysctl.set_defaults(func=cmd_tune_sysctl)
 
     p_tune = sub.add_parser("tune", help="运行 AIMD 动态带宽调整循环")
     p_tune.add_argument("--iface")
@@ -1295,15 +1460,17 @@ def main():
                          help="CPU 总体繁忙占比异常阈值(%%)，默认 90")
     p_auto.add_argument("--softirq-pct-threshold", dest="softirq_pct_threshold", type=float,
                          help="软中断占比异常阈值(%%)，默认 30")
-    p_auto.add_argument("--no-speedtest", dest="no_speedtest", action="store_true",
-                         help="网卡探测不到真实速率时，不要额外做一次实测（默认会做）")
+    p_auto.add_argument("--try-speedtest", dest="try_speedtest", action="store_true",
+                         help="网卡探测不到真实速率时，尝试用 Ookla Speedtest CLI 测一次（默认不测，需要显式开启）")
     p_auto.add_argument("--force-speedtest", dest="force_speedtest", action="store_true",
-                         help="即使这次实测结果比历史记录低很多，也强制采信这次实测（默认会保守地沿用历史记录）")
+                         help="强制测速并采信结果，即使当前高并发或者结果比历史记录低很多（隐含开启 --try-speedtest）")
     p_auto.add_argument("--max-only", dest="max_only", action="store_true",
                          help="直接跑满 max-ceil，不再自动降速，只监控展示（不在乎稳不稳、只要跑满带宽时用）")
+    p_auto.add_argument("--no-sysctl-tune", dest="no_sysctl_tune", action="store_true",
+                         help="不要自动调 TCP buffer/conntrack 表大小等常规 sysctl 参数（默认会调）")
     p_auto.set_defaults(func=cmd_auto)
 
-    p_speedtest = sub.add_parser("speedtest", help="单独测一次上传/下载速度（用 Cloudflare 节点，不需要你自己准备对端）")
+    p_speedtest = sub.add_parser("speedtest", help="单独测一次上传/下载速度（用 Ookla Speedtest CLI，不需要你自己准备对端）")
     p_speedtest.set_defaults(func=cmd_speedtest)
 
     p_priority = sub.add_parser("priority-ip", help="给指定 IP 单独建高优先级 htb class，不用跟其他连接公平分带宽")
