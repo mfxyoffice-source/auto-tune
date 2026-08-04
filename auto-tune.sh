@@ -2,16 +2,12 @@
 # auto-tune.sh —— 一键安装/运行入口（bash 外壳 + 内嵌 Python payload）
 #
 # 用法：
-#   curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/auto-tune.sh | sudo bash
+#   bash <(curl -Ls https://raw.githubusercontent.com/mfxyoffice-source/auto-tune/main/auto-tune.sh)
 #
 # 这个 bash 脚本本身不做网络调优的实际逻辑，只负责三件事：
 #   1. 检查 root 权限 / python3 是否存在
 #   2. 把内嵌的 Python 源码落盘到 /opt/auto-tune/auto-tune.py
 #   3. exec 执行它，把命令行参数原样透传（不带参数时会进入数字菜单）
-#
-# 也支持跳过菜单直接执行子命令，例如：
-#   curl -fsSL <上面的地址> | sudo bash -s -- check
-#   curl -fsSL <上面的地址> | sudo bash -s -- auto
 
 set -euo pipefail
 
@@ -20,7 +16,7 @@ CONFIG_DIR="/etc/auto-tune"
 PY_PATH="$INSTALL_DIR/auto-tune.py"
 
 if [[ "$(id -u)" -ne 0 ]]; then
-    echo "请用 root 权限运行，例如: curl -fsSL <raw_url> | sudo bash" >&2
+    echo "请用 root 权限运行" >&2
     exit 1
 fi
 
@@ -117,8 +113,9 @@ UP_STEP=0.05
 # 检测到异常时每周期下调比例（乘法快降）
 DOWN_STEP=0.15
 
-# 单周期新增重传超过这个数视为异常
-RETRANS_THRESHOLD=5
+# 重传率超过这个百分比视为异常（用比例而不是绝对数量，不会随这台机器
+# 自身流量大小的正常波动而误判；一个周期里发送量太小时会自动跳过判断）
+RETRANS_PCT_THRESHOLD=2.0
 
 # 单周期新增 qdisc drop 超过这个数视为异常
 DROP_THRESHOLD=1
@@ -410,27 +407,71 @@ def get_qdisc_drops(iface):
     return total
 
 
-def get_tcp_retrans_total():
-    out = run("nstat -az TcpRetransSegs 2>/dev/null", check=False)
+def get_tcp_stats():
+    """返回 (retrans_segs, out_segs)，任一读取失败则对应项为 None。
+    out_segs 用于把 retrans 换算成比例，而不是用绝对数量判断——这样不会
+    随这台机器本身流量大小的自然波动而误判。"""
+    retrans, out_segs = None, None
+
+    out = run("nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null", check=False)
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[0] == "TcpRetransSegs":
+        if len(parts) < 2:
+            continue
+        if parts[0] == "TcpRetransSegs":
             try:
-                return int(parts[1])
+                retrans = int(parts[1])
             except ValueError:
                 pass
-    out = run("cat /proc/net/snmp | grep -A1 '^Tcp:'", check=False)
-    lines = out.splitlines()
-    if len(lines) == 2:
-        headers = lines[0].split()
-        values = lines[1].split()
-        if "RetransSegs" in headers:
-            idx = headers.index("RetransSegs")
+        elif parts[0] == "TcpOutSegs":
             try:
-                return int(values[idx])
-            except (ValueError, IndexError):
+                out_segs = int(parts[1])
+            except ValueError:
                 pass
-    return None
+
+    if retrans is not None and out_segs is not None:
+        return retrans, out_segs
+
+    # 退路：直接读 /proc/net/snmp 用 Python 解析（不依赖 grep，
+    # 避免 grep -A1 匹配到 Tcp 数值行本身导致多算一行的问题）
+    fb_retrans, fb_out = read_proc_net_snmp_tcp()
+    if retrans is None:
+        retrans = fb_retrans
+    if out_segs is None:
+        out_segs = fb_out
+
+    return retrans, out_segs
+
+
+def read_proc_net_snmp_tcp():
+    try:
+        with open("/proc/net/snmp") as f:
+            content = f.read()
+    except OSError:
+        return None, None
+    tcp_lines = [ln for ln in content.splitlines() if ln.startswith("Tcp:")]
+    if len(tcp_lines) < 2:
+        return None, None
+    headers = tcp_lines[0].split()
+    values = tcp_lines[1].split()
+    retrans, out_segs = None, None
+    if "RetransSegs" in headers:
+        try:
+            retrans = int(values[headers.index("RetransSegs")])
+        except (ValueError, IndexError):
+            pass
+    if "OutSegs" in headers:
+        try:
+            out_segs = int(values[headers.index("OutSegs")])
+        except (ValueError, IndexError):
+            pass
+    return retrans, out_segs
+
+
+def get_tcp_retrans_total():
+    """兼容旧接口，仅返回重传总数（不换算比例的场景用，目前仅 check 之外无调用）。"""
+    retrans, _ = get_tcp_stats()
+    return retrans
 
 
 def get_class_current_rate(iface, classid):
@@ -487,7 +528,7 @@ def cmd_tune(args):
     interval = float(pick(args.interval, "INTERVAL", 8.0, float))
     up_step = float(pick(args.up_step, "UP_STEP", 0.05, float))
     down_step = float(pick(args.down_step, "DOWN_STEP", 0.15, float))
-    retrans_threshold = int(pick(args.retrans_threshold, "RETRANS_THRESHOLD", 5, int))
+    retrans_pct_threshold = float(pick(args.retrans_pct_threshold, "RETRANS_PCT_THRESHOLD", 2.0, float))
     drop_threshold = int(pick(args.drop_threshold, "DROP_THRESHOLD", 1, int))
     apply_flag = args.apply or (env.get("APPLY", "false").lower() == "true")
 
@@ -513,13 +554,15 @@ def cmd_tune(args):
     current = max(min_bps, min(current, max_bps))
 
     logging.info(
-        "启动 AIMD 调优 | iface=%s classid=%s 起点=%s 范围=[%s, %s] 周期=%ss 模式=%s",
+        "启动 AIMD 调优 | iface=%s classid=%s 起点=%s 范围=[%s, %s] 周期=%ss "
+        "重传率阈值=%.2f%% 模式=%s",
         iface, classid, bps_to_rate_str(current), min_rate, max_ceil, interval,
+        retrans_pct_threshold,
         "APPLY" if apply_flag else "DRY-RUN（不会下发配置）",
     )
 
     last_drops = get_qdisc_drops(iface)
-    last_retrans = get_tcp_retrans_total()
+    last_retrans, last_outsegs = get_tcp_stats()
     iteration = 0
 
     try:
@@ -528,34 +571,48 @@ def cmd_tune(args):
             iteration += 1
 
             drops_now = get_qdisc_drops(iface)
-            retrans_now = get_tcp_retrans_total()
+            retrans_now, outsegs_now = get_tcp_stats()
 
             drop_delta = drops_now - last_drops
-            retrans_delta = (
-                (retrans_now - last_retrans)
-                if (retrans_now is not None and last_retrans is not None)
-                else 0
-            )
 
-            anomaly = (drop_delta > drop_threshold) or (retrans_delta > retrans_threshold)
+            retrans_delta = 0
+            outsegs_delta = 0
+            if retrans_now is not None and last_retrans is not None:
+                retrans_delta = max(0, retrans_now - last_retrans)
+            if outsegs_now is not None and last_outsegs is not None:
+                outsegs_delta = max(0, outsegs_now - last_outsegs)
+
+            # 用比例而不是绝对数量判断：流量大的时候重传绝对数自然会多，
+            # 只有"重传占发送总量的比例"升高才说明真的在丢包/拥塞。
+            # 这个周期几乎没有新发送数据时（outsegs_delta 太小），比例噪音很大，
+            # 直接跳过本轮异常判断，避免误报。
+            if outsegs_delta >= 200:
+                retrans_pct = (retrans_delta / outsegs_delta) * 100
+            else:
+                retrans_pct = 0.0
+
+            anomaly = (drop_delta > drop_threshold) or (retrans_pct > retrans_pct_threshold)
 
             if anomaly:
                 new_rate = max(min_bps, current * (1 - down_step))
                 logging.info(
-                    "[周期 %d] 异常: drop+%d retrans+%d -> 下调 %s -> %s",
-                    iteration, drop_delta, retrans_delta,
+                    "[周期 %d] 异常: drop+%d 重传率=%.2f%%(retrans+%d/out+%d) -> 下调 %s -> %s",
+                    iteration, drop_delta, retrans_pct, retrans_delta, outsegs_delta,
                     bps_to_rate_str(current), bps_to_rate_str(new_rate),
                 )
             else:
                 new_rate = min(max_bps, current * (1 + up_step))
                 if new_rate != current:
                     logging.info(
-                        "[周期 %d] 正常: drop+%d retrans+%d -> 上调 %s -> %s",
-                        iteration, drop_delta, retrans_delta,
+                        "[周期 %d] 正常: drop+%d 重传率=%.2f%%(retrans+%d/out+%d) -> 上调 %s -> %s",
+                        iteration, drop_delta, retrans_pct, retrans_delta, outsegs_delta,
                         bps_to_rate_str(current), bps_to_rate_str(new_rate),
                     )
                 else:
-                    logging.info("[周期 %d] 正常，已在上限 %s，保持不变", iteration, bps_to_rate_str(current))
+                    logging.info(
+                        "[周期 %d] 正常，已在上限 %s，保持不变（重传率=%.2f%%）",
+                        iteration, bps_to_rate_str(current), retrans_pct,
+                    )
 
             if abs(new_rate - current) / current > 0.005:
                 apply_rate(iface, classid, new_rate * 0.9, new_rate, dry_run)
@@ -563,6 +620,7 @@ def cmd_tune(args):
 
             last_drops = drops_now
             last_retrans = retrans_now if retrans_now is not None else last_retrans
+            last_outsegs = outsegs_now if outsegs_now is not None else last_outsegs
 
             if args.max_iterations and iteration >= args.max_iterations:
                 logging.info("达到 --max-iterations=%d，退出", args.max_iterations)
@@ -711,7 +769,7 @@ def cmd_auto(args):
         f"INTERVAL=8\n"
         f"UP_STEP=0.05\n"
         f"DOWN_STEP=0.15\n"
-        f"RETRANS_THRESHOLD=5\n"
+        f"RETRANS_PCT_THRESHOLD=2.0\n"
         f"DROP_THRESHOLD=1\n"
         f"APPLY=true\n"
     )
@@ -836,7 +894,8 @@ def main():
     p_tune.add_argument("--interval", type=float)
     p_tune.add_argument("--up-step", dest="up_step", type=float)
     p_tune.add_argument("--down-step", dest="down_step", type=float)
-    p_tune.add_argument("--retrans-threshold", dest="retrans_threshold", type=int)
+    p_tune.add_argument("--retrans-pct-threshold", dest="retrans_pct_threshold", type=float,
+                         help="重传率超过这个百分比视为异常，默认 2.0（即 2%%）")
     p_tune.add_argument("--drop-threshold", dest="drop_threshold", type=int)
     p_tune.add_argument("--apply", action="store_true", help="真正下发 tc 命令；不加则只打印计划")
     p_tune.add_argument("--env-file", dest="env_file", help="从配置文件读取参数（CLI 参数优先级更高）")
