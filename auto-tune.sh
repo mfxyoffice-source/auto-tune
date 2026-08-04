@@ -1106,6 +1106,56 @@ auto，或者直接改配置文件里的 MAX_CEIL。
 """)
 
 
+def cmd_priority_ip(args):
+    """给指定 IP（比如你自己固定用来测速的出口 IP）单独建一个高优先级的 htb class，
+    不用再跟其他所有连接公平分带宽——htb 的 prio 数值越小优先级越高，当链路整体
+    紧张时，这个 class 会被优先服务，其他流量走默认 class，排在它后面。
+
+    这跟『整体不限速』不冲突：两个 class 的 ceil 都设成物理链路速率，平时没人抢的时候
+    大家都能跑满；只有当总需求超过物理带宽、出现真实拥塞时，优先级才会体现出来——
+    指定 IP 优先吃到带宽，其他流量分剩下的。"""
+    require_root()
+
+    iface = args.iface or detect_default_iface()
+    if not iface:
+        logging.error("自动探测网卡失败，请用 --iface 指定")
+        sys.exit(1)
+
+    line_rate_mbit = args.line_rate_mbit
+    priority_rate_mbit = args.priority_rate_mbit or max(50, int(line_rate_mbit * 0.2))
+    default_rate_mbit = max(10, line_rate_mbit - priority_rate_mbit)
+    ip = args.ip
+
+    cmds = [
+        f"tc qdisc del dev {iface} root",  # 先清掉已有的，不管是不是本脚本建的（失败忽略，可能本来就没有）
+        f"tc qdisc add dev {iface} root handle 1: htb default 20",
+        f"tc class add dev {iface} parent 1: classid 1:1 htb rate {line_rate_mbit}mbit ceil {line_rate_mbit}mbit",
+        f"tc class add dev {iface} parent 1:1 classid 1:10 htb rate {priority_rate_mbit}mbit ceil {line_rate_mbit}mbit prio 0",
+        f"tc class add dev {iface} parent 1:1 classid 1:20 htb rate {default_rate_mbit}mbit ceil {line_rate_mbit}mbit prio 1",
+        f"tc qdisc add dev {iface} parent 1:10 handle 10: fq",
+        f"tc qdisc add dev {iface} parent 1:20 handle 20: fq",
+        f"tc filter add dev {iface} parent 1: protocol ip prio 1 u32 match ip src {ip} flowid 1:10",
+    ]
+
+    logging.info(
+        "计划为 %s 建立优先级拓扑：IP %s 单独进 1:10（prio 0，保底 %smbit，可借用到全速 %smbit），"
+        "其他流量走 1:20（prio 1，保底 %smbit，同样可借用到全速）",
+        iface, ip, priority_rate_mbit, line_rate_mbit, default_rate_mbit,
+    )
+    for c in cmds:
+        logging.info("  %s", c)
+
+    if not args.apply:
+        logging.info("[dry-run] 未加 --apply，不会真正执行。确认无误后加 --apply 执行。")
+        return
+
+    for c in cmds:
+        run(c, check=False)  # qdisc del 那条大概率会因为『本来就没有』报错，忽略即可
+
+    logging.info("完成。用 `tc -s qdisc show dev %s` 和 `tc filter show dev %s` 确认状态。", iface, iface)
+    logging.info("撤销：tc qdisc del dev %s root（会把这套优先级拓扑连同分类一起清空，回到无 tc 限制状态）", iface)
+
+
 def cmd_uninstall(args):
     require_root()
     run("systemctl stop auto-tune", check=False)
@@ -1255,6 +1305,16 @@ def main():
 
     p_speedtest = sub.add_parser("speedtest", help="单独测一次上传/下载速度（用 Cloudflare 节点，不需要你自己准备对端）")
     p_speedtest.set_defaults(func=cmd_speedtest)
+
+    p_priority = sub.add_parser("priority-ip", help="给指定 IP 单独建高优先级 htb class，不用跟其他连接公平分带宽")
+    p_priority.add_argument("--ip", required=True, help="要给优先级的源 IP（比如你固定用来测速的出口 IP），支持 CIDR 如 1.2.3.4/32")
+    p_priority.add_argument("--iface", help="网卡名，不给则自动探测")
+    p_priority.add_argument("--line-rate-mbit", dest="line_rate_mbit", type=int, required=True,
+                             help="这台机器物理链路速率上限(Mbit)，两个 class 的 ceil 都设成这个值，不建议超过真实带宽")
+    p_priority.add_argument("--priority-rate-mbit", dest="priority_rate_mbit", type=int,
+                             help="优先级 class 的保底速率(Mbit)，不给则默认取 line-rate 的 20%%")
+    p_priority.add_argument("--apply", action="store_true", help="真正执行 tc 命令；不加则只打印计划")
+    p_priority.set_defaults(func=cmd_priority_ip)
 
     p_uninstall = sub.add_parser("uninstall", help="卸载 systemd 服务和安装的文件")
     p_uninstall.add_argument("--purge-config", action="store_true", help="连配置文件一起删除")
