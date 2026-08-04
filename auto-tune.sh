@@ -661,7 +661,11 @@ def pick_profile_by_concurrency(established):
         # 探测不到就用中等保守的通用默认值
         return dict(interval=8.0, retrans_pct_threshold=2.0, min_pct=0.5, max_pct=0.9, label="未知（默认档）")
     if established >= 500:
-        return dict(interval=20.0, retrans_pct_threshold=1.5, min_pct=0.6, max_pct=0.9, label=f"高并发（{established} 个连接）")
+        # min_pct 从 0.6 调低到 0.3：实测发现高并发机器在内存/CPU 压力大的时候，
+        # 真实能扛住的下限可能远低于『速率的 60%』这个假设（今天实测过一次，
+        # 真实健康区间落在 30%-40% 左右），下限留宽松点，给 AIMD 更大的探索空间，
+        # 不会让它卡在一个已经不现实的地板上空转。上限 0.9 不变。
+        return dict(interval=20.0, retrans_pct_threshold=1.5, min_pct=0.3, max_pct=0.9, label=f"高并发（{established} 个连接）")
     if established >= 50:
         return dict(interval=10.0, retrans_pct_threshold=2.0, min_pct=0.55, max_pct=0.9, label=f"中等并发（{established} 个连接）")
     return dict(interval=8.0, retrans_pct_threshold=2.0, min_pct=0.5, max_pct=0.85, label=f"低并发（{established} 个连接）")
