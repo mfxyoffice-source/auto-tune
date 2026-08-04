@@ -1158,7 +1158,8 @@ def cmd_auto(args):
       --drop-threshold            判定异常的单周期 qdisc drop 数量阈值
       --cpu-pct-threshold          CPU 总体繁忙占比异常阈值
       --softirq-pct-threshold      软中断占比异常阈值
-    带宽探测顺序：--link-mbit 手动指定 > 网卡自报速率(ethtool/sysfs) > 历史记录 > 保守默认值 1000。
+    带宽探测顺序：--link-mbit 手动指定(CLI) > 网卡自报速率(ethtool/sysfs) > 交互式手动输入
+    (仅在有可用终端时才会提示，脚本化/非交互场景会自动跳过) > 历史记录 > 保守默认值 1000。
     注意：speedtest 测速工具跟这条判断链完全无关——speedtest 只是给你自己看数字用的独立
     诊断工具（对应 speedtest 子命令 / 菜单里的『测速』选项），不会被 auto 自动调用、
     不会影响任何配置。这台机器上并发一高，单次测速的数字天然不准，直接拿来配置反而有害，
@@ -1178,7 +1179,7 @@ def cmd_auto(args):
     established = detect_established_connections()
     profile = pick_profile_by_concurrency(established)
 
-    # 2. 探测链路速率：手动指定 > 网卡自报 > 历史记录 > 保守默认值（不包含测速）
+    # 2. 探测链路速率：手动指定(CLI) > 网卡自报 > 交互式手动输入(仅在有终端时) > 历史记录 > 保守默认值
     last_known = read_last_known_speed()
     speed_mbit = args.link_mbit or detect_link_speed_mbit(iface)
     trust_this_value = bool(speed_mbit)  # 手动指定/网卡自报的值直接信
@@ -1186,7 +1187,15 @@ def cmd_auto(args):
     if speed_mbit:
         logging.info("探测到链路速率: %smbit", speed_mbit)
     else:
-        logging.info("网卡没有上报真实速率（虚拟网卡常见），不会自动测速，改用历史记录/默认值")
+        logging.info("网卡没有上报真实速率（虚拟网卡常见）")
+        manual_raw = read_tty_line("网卡探测不到真实速率，手动输入上行带宽(Mbit)，不知道就直接回车跳过: ")
+        if manual_raw is not None and manual_raw.strip():
+            try:
+                speed_mbit = int(float(manual_raw.strip()))
+                trust_this_value = True
+                logging.info("使用手动输入的上行带宽: %smbit", speed_mbit)
+            except ValueError:
+                logging.warning("输入的不是数字（%r），忽略", manual_raw.strip())
 
     if not speed_mbit and last_known:
         speed_mbit = int(last_known)
