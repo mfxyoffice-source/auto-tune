@@ -532,12 +532,21 @@ def run_speedtest(timeout=60):
     # --accept-license --accept-gdpr 是必须的：第一次跑官方 CLI 默认会交互式提示你
     # 输入 YES 接受协议，脚本化场景下没有交互输入会直接卡住，加这两个参数跳过确认。
     # -f json 用机器可读格式，比解析人类可读文本更可靠。
+    # 注意：这个 CLI 没有 --timeout 参数（不是 sivel 那个第三方工具），传了会被直接拒绝、
+    # 打印帮助文档退出——超时控制交给下面 run() 的 timeout 参数，不在命令行里传。
     out = run(
-        f"speedtest --accept-license --accept-gdpr -f json --timeout {timeout}",
+        "speedtest --accept-license --accept-gdpr -f json",
         check=False, timeout=timeout + 15,
     )
     if not out:
         logging.warning("Speedtest CLI 没有返回任何结果（可能是找不到可用的测速节点，或超时）")
+        return None, None
+
+    if out.strip().startswith("Speedtest by Ookla") or "Usage: speedtest" in out:
+        logging.warning(
+            "Speedtest CLI 打印的是帮助文档而不是测速结果，说明命令行参数有问题被它拒绝了，"
+            "不是网络/节点的问题。原始输出：\n%s", out.strip()
+        )
         return None, None
 
     try:
