@@ -115,6 +115,10 @@ CPU_PCT_THRESHOLD=90.0
 # 软中断（处理网卡收发/转发的那部分 CPU 开销）占比超过这个百分比视为异常
 SOFTIRQ_PCT_THRESHOLD=30.0
 
+# true 时直接跑满 MAX_CEIL，不再自动降速——重传率/丢包/CPU 超标也不会被拉回来，
+# 只在日志里展示这些指标供你参考。适合『只要跑满带宽，不在乎稳不稳』的场景。
+MAX_ONLY=false
+
 # 是否真正下发 tc 命令。首次部署强烈建议先 false，观察日志确认判断合理再改 true。
 APPLY=false
 """
@@ -676,6 +680,7 @@ def cmd_tune(args):
     drop_threshold = int(pick(args.drop_threshold, "DROP_THRESHOLD", 1, int))
     cpu_pct_threshold = float(pick(args.cpu_pct_threshold, "CPU_PCT_THRESHOLD", 90.0, float))
     softirq_pct_threshold = float(pick(args.softirq_pct_threshold, "SOFTIRQ_PCT_THRESHOLD", 30.0, float))
+    max_only = args.max_only or (env.get("MAX_ONLY", "false").lower() == "true")
     apply_flag = args.apply or (env.get("APPLY", "false").lower() == "true")
 
     for name, val in [("iface", iface), ("classid", classid), ("min_rate", min_rate), ("max_ceil", max_ceil)]:
@@ -698,6 +703,58 @@ def cmd_tune(args):
         )
         current = min_bps
     current = max(min_bps, min(current, max_bps))
+
+    if max_only:
+        # 跑满模式：直接顶到 max_ceil，之后只监控展示，不再根据重传/丢包/CPU 自动降速。
+        logging.info(
+            "MAX_ONLY 模式 | iface=%s classid=%s 直接跑满 %s（不再自动降速，仅监控展示）模式=%s",
+            iface, classid, bps_to_rate_str(max_bps),
+            "APPLY" if apply_flag else "DRY-RUN（不会下发配置）",
+        )
+        apply_rate(iface, classid, min_bps, max_bps, dry_run)
+        current = max_bps
+
+        last_drops = get_qdisc_drops(iface)
+        last_retrans, last_outsegs = get_tcp_stats()
+        last_cpu = get_cpu_times()
+        iteration = 0
+        try:
+            while True:
+                time.sleep(interval)
+                iteration += 1
+
+                drops_now = get_qdisc_drops(iface)
+                retrans_now, outsegs_now = get_tcp_stats()
+                cpu_now = get_cpu_times()
+
+                drop_delta = drops_now - last_drops
+                retrans_delta = max(0, (retrans_now or 0) - (last_retrans or 0)) if last_retrans is not None else 0
+                outsegs_delta = max(0, (outsegs_now or 0) - (last_outsegs or 0)) if last_outsegs is not None else 0
+                retrans_pct = (retrans_delta / outsegs_delta * 100) if outsegs_delta >= 200 else 0.0
+                cpu_pct, softirq_pct = compute_cpu_pct(last_cpu, cpu_now)
+
+                logging.info(
+                    "[周期 %d] MAX_ONLY 维持满速 %s（drop+%d 重传率=%.2f%% CPU=%.0f%%/软中断=%.0f%%，仅展示不调整）",
+                    iteration, bps_to_rate_str(max_bps), drop_delta, retrans_pct, cpu_pct, softirq_pct,
+                )
+
+                # 确保速率没有被外部其它进程改动过，MAX_ONLY 模式下始终把它顶回满速
+                actual = get_class_current_rate(iface, classid)
+                if actual is not None and abs(actual - max_bps) / max_bps > 0.01:
+                    logging.info("检测到速率被改动（当前 %s），重新顶回满速 %s", bps_to_rate_str(actual), bps_to_rate_str(max_bps))
+                    apply_rate(iface, classid, min_bps, max_bps, dry_run)
+
+                last_drops = drops_now
+                last_retrans = retrans_now if retrans_now is not None else last_retrans
+                last_outsegs = outsegs_now if outsegs_now is not None else last_outsegs
+                last_cpu = cpu_now if cpu_now is not None else last_cpu
+
+                if args.max_iterations and iteration >= args.max_iterations:
+                    logging.info("达到 --max-iterations=%d，退出", args.max_iterations)
+                    break
+        except KeyboardInterrupt:
+            logging.info("收到中断信号，退出。当前速率保持在满速 %s。", bps_to_rate_str(max_bps))
+        return
 
     logging.info(
         "启动 AIMD 调优 | iface=%s classid=%s 起点=%s 范围=[%s, %s] 周期=%ss "
@@ -1019,6 +1076,7 @@ def cmd_auto(args):
         f"DROP_THRESHOLD={drop_threshold}\n"
         f"CPU_PCT_THRESHOLD={cpu_pct_threshold}\n"
         f"SOFTIRQ_PCT_THRESHOLD={softirq_pct_threshold}\n"
+        f"MAX_ONLY={'true' if args.max_only else 'false'}\n"
         f"APPLY=true\n"
     )
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -1114,7 +1172,7 @@ def run_menu():
             up_step=None, down_step=None,
             retrans_pct_threshold=None, drop_threshold=None,
             cpu_pct_threshold=None, softirq_pct_threshold=None,
-            no_speedtest=False, force_speedtest=False,
+            no_speedtest=False, force_speedtest=False, max_only=False,
         ))
     elif choice == "2":
         cmd_check(argparse.Namespace(iface=None, classid=None))
@@ -1158,6 +1216,8 @@ def main():
                          help="软中断占比异常阈值(%%)，默认 30")
     p_tune.add_argument("--apply", action="store_true", help="真正下发 tc 命令；不加则只打印计划")
     p_tune.add_argument("--env-file", dest="env_file", help="从配置文件读取参数（CLI 参数优先级更高）")
+    p_tune.add_argument("--max-only", dest="max_only", action="store_true",
+                         help="直接跑满 max-ceil，不再自动降速，只监控展示（不在乎稳不稳、只要跑满带宽时用）")
     p_tune.add_argument("--max-iterations", dest="max_iterations", type=int, default=0)
     p_tune.set_defaults(func=cmd_tune)
 
@@ -1189,6 +1249,8 @@ def main():
                          help="网卡探测不到真实速率时，不要额外做一次实测（默认会做）")
     p_auto.add_argument("--force-speedtest", dest="force_speedtest", action="store_true",
                          help="即使这次实测结果比历史记录低很多，也强制采信这次实测（默认会保守地沿用历史记录）")
+    p_auto.add_argument("--max-only", dest="max_only", action="store_true",
+                         help="直接跑满 max-ceil，不再自动降速，只监控展示（不在乎稳不稳、只要跑满带宽时用）")
     p_auto.set_defaults(func=cmd_auto)
 
     p_speedtest = sub.add_parser("speedtest", help="单独测一次上传/下载速度（用 Cloudflare 节点，不需要你自己准备对端）")
