@@ -381,6 +381,11 @@ def do_tune_sysctl(apply, speed_mbit=None, established=None):
         "net.ipv4.tcp_tw_reuse = 1",
         "net.ipv4.tcp_fin_timeout = 15",
         "net.ipv4.tcp_keepalive_time = 300",
+        # 代理场景的连接天然是一阵一阵的（闲置一下又突然有新请求），关掉这个默认行为，
+        # 避免每次连接从闲置恢复活跃时都被强制重新慢启动一遍，直接省掉这部分延迟。
+        # 这个只影响『已经建立、曾经闲置过』的连接怎么恢复速度，不会增加任何额外负担，
+        # 跟内存/CPU 紧张与否无关，安全可加。
+        "net.ipv4.tcp_slow_start_after_idle = 0",
         "net.ipv4.ip_local_port_range = 1024 65535",
         "net.core.somaxconn = 65535",
         "net.core.netdev_max_backlog = 4096",
