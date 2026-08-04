@@ -1176,8 +1176,11 @@ def cmd_auto(args):
       --drop-threshold            判定异常的单周期 qdisc drop 数量阈值
       --cpu-pct-threshold          CPU 总体繁忙占比异常阈值
       --softirq-pct-threshold      软中断占比异常阈值
-    带宽探测顺序：--link-mbit 手动指定(CLI) > 网卡自报速率(ethtool/sysfs) > 交互式手动输入
-    (仅在有可用终端时才会提示，脚本化/非交互场景会自动跳过) > 历史记录 > 保守默认值 1000。
+    带宽探测顺序：--link-mbit 手动指定(CLI) > 网卡自报速率(ethtool/sysfs) > 保守默认值 1000。
+    就这三层，不查历史记录、不弹交互提示、不测速——纯粹依赖网卡自己汇报的信息。
+    很多云厂商的虚拟网卡不上报真实速率，这种情况下网卡自报这一步测不到，就会直接
+    用保守默认值，需要准确数字的话用 --link-mbit 手动指定，或者用菜单里的
+    『手动输入上下行带宽』选项（那是显式的手动操作，不算在这条自动判断链里）。
     注意：speedtest 测速工具跟这条判断链完全无关——speedtest 只是给你自己看数字用的独立
     诊断工具（对应 speedtest 子命令 / 菜单里的『测速』选项），不会被 auto 自动调用、
     不会影响任何配置。这台机器上并发一高，单次测速的数字天然不准，直接拿来配置反而有害，
@@ -1197,35 +1200,23 @@ def cmd_auto(args):
     established = detect_established_connections()
     profile = pick_profile_by_concurrency(established)
 
-    # 2. 探测链路速率：手动指定(CLI) > 网卡自报 > 交互式手动输入(仅在有终端时) > 历史记录 > 保守默认值
-    last_known = read_last_known_speed()
+    # 2. 探测链路速率：手动指定(CLI) > 网卡自报(ethtool/sysfs) > 保守默认值
+    #    不查历史记录、不弹交互提示——纯网卡自身信息，测不到就直接用默认值。
     speed_mbit = args.link_mbit or detect_link_speed_mbit(iface)
     trust_this_value = bool(speed_mbit)  # 手动指定/网卡自报的值直接信
 
     if speed_mbit:
         logging.info("探测到链路速率: %smbit", speed_mbit)
     else:
-        logging.info("网卡没有上报真实速率（虚拟网卡常见）")
-        manual_raw = read_tty_line("网卡探测不到真实速率，手动输入上行带宽(Mbit)，不知道就直接回车跳过: ")
-        if manual_raw is not None and manual_raw.strip():
-            try:
-                speed_mbit = int(float(manual_raw.strip()))
-                trust_this_value = True
-                logging.info("使用手动输入的上行带宽: %smbit", speed_mbit)
-            except ValueError:
-                logging.warning("输入的不是数字（%r），忽略", manual_raw.strip())
-
-    if not speed_mbit and last_known:
-        speed_mbit = int(last_known)
-        trust_this_value = True
-        logging.warning("这次没能探测到任何真实速率，沿用上次记录的 %smbit", speed_mbit)
-
-    if not speed_mbit:
         speed_mbit = 1000
         trust_this_value = False
-        logging.warning("最终没能测出真实速率，使用保守默认值 %smbit。可以用 --link-mbit 手动指定更准确的值。", speed_mbit)
+        logging.warning(
+            "网卡没有上报真实速率（虚拟网卡常见），使用保守默认值 %smbit。"
+            "想用准确的真实值，请用 --link-mbit 手动指定，或者菜单里选『手动输入上下行带宽』。",
+            speed_mbit,
+        )
 
-    # 只记录『有依据』的判断结果，不把没有任何信息支撑的保守默认值当成历史基准存下来
+    # 只记录『有依据』的判断结果，供 check/菜单展示参考，不影响这次的判断本身
     if trust_this_value:
         write_last_known_speed(speed_mbit)
 
@@ -1424,7 +1415,7 @@ def run_menu():
   网卡: {probe_iface or '探测失败'}   网卡自报速率: {f'{probe_speed}mbit' if probe_speed else '无法探测（虚拟网卡常见）'}
   上次记录的上行: {f'{last_up:.0f}mbit' if last_up else '无'}   上次记录的下行: {f'{last_down:.0f}mbit（仅供参考）' if last_down else '无'}
 ----------------------------------------------------------------------
-  1) 全自动部署         用已知带宽(手动/网卡自报/历史记录)建拓扑->开BBR->写配置->启动服务  [默认]
+  1) 全自动部署         网卡自报带宽(测不到则用默认值)建拓扑->开BBR->写配置->启动服务  [默认]
   2) 手动输入上下行带宽  写入配置并立即部署（上行用于限速，下行仅记录，不参与限速）
   3) 测速                只测试查看，不影响任何配置
   4) 只读检查            查看当前 BBR / qdisc / sysctl 状态，不改任何东西
