@@ -1410,7 +1410,8 @@ def run_menu():
   2) 手动输入上下行带宽  写入配置并立即部署（上行用于限速，下行仅记录，不参与限速）
   3) 测速                只测试查看，不影响任何配置
   4) 只读检查            查看当前 BBR / qdisc / sysctl 状态，不改任何东西
-  5) 卸载                停止并移除已安装的服务和文件
+  5) 查看日志            实时看 AIMD 调整过程（journalctl -u auto-tune -f，Ctrl+C 退出）
+  6) 卸载                停止并移除已安装的服务和文件
   0) 退出
 ======================================================================""")
     raw = read_tty_line("请输入数字后回车（直接回车 = 1）: ")
@@ -1454,6 +1455,17 @@ def run_menu():
         cmd_check(argparse.Namespace(iface=None, classid=None))
 
     elif choice == "5":
+        print("按 Ctrl+C 退出日志查看\n")
+        try:
+            with open("/dev/tty") as tty_in:
+                subprocess.run(["journalctl", "-u", "auto-tune", "-f"], stdin=tty_in)
+        except (OSError, FileNotFoundError):
+            # 没有可用终端（比如管道方式运行）就退化成非交互输出一段，不阻塞
+            run("journalctl -u auto-tune -n 50 --no-pager", check=False)
+        except KeyboardInterrupt:
+            pass
+
+    elif choice == "6":
         cmd_uninstall(argparse.Namespace(purge_config=False))
 
     elif choice == "0":
