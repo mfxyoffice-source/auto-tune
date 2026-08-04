@@ -67,6 +67,7 @@ LOG_PATH = "/var/log/auto-tune.log"
 INSTALL_DIR = "/opt/auto-tune"
 CONFIG_DIR = "/etc/auto-tune"
 ENV_PATH = f"{CONFIG_DIR}/auto-tune.env"
+STATE_PATH = f"{CONFIG_DIR}/last-known-speed.mbit"
 SERVICE_PATH = "/etc/systemd/system/auto-tune.service"
 SYSCTL_BACKUP_DIR = "/etc/auto-tune/sysctl-backup"
 SYSCTL_TUNE_FILE = "/etc/sysctl.d/99-auto-tune.conf"
@@ -392,6 +393,27 @@ def run_speedtest(download_bytes=30_000_000, upload_bytes=15_000_000, timeout=25
         logging.warning("上传测速失败: %s", e)
 
     return down_mbit, up_mbit
+
+
+def read_last_known_speed():
+    """读取上一次 auto 判定出来的『可信』链路速率（mbit），读不到返回 None。
+    用来在这次实测结果明显异常偏低时做个理智检查，不轻易被单次失真的测速带偏。"""
+    try:
+        with open(STATE_PATH) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def write_last_known_speed(mbit):
+    """记录这次判定出来的链路速率，供下次 auto 运行时做理智检查。
+    写入失败不影响主流程，静默忽略。"""
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(STATE_PATH, "w") as f:
+            f.write(f"{mbit}\n")
+    except OSError:
+        pass
 
 
 def cmd_speedtest(args):
@@ -890,32 +912,73 @@ def cmd_auto(args):
         sys.exit(1)
     logging.info("使用网卡: %s", iface)
 
-    # 2. 探测链路速率：手动指定 > 网卡自报 > 实测测速 > 保守默认值
+    # 提前探测并发连接数，一是用来挑参数画像，二是用来判断『现在适不适合测速』——
+    # 已经有大量真实连接在跑的机器，测速结果天然会被真实流量抢占带宽/CPU 拖低，
+    # 与其测完再靠历史记录去纠正，不如一开始就跳过这次测速。
+    established = detect_established_connections()
+    profile = pick_profile_by_concurrency(established)
+    speedtest_unsafe = established is not None and established >= 500
+
+    # 2. 探测链路速率：手动指定 > 网卡自报 > 实测测速（有历史记录做理智检查）> 历史记录 > 保守默认值
+    last_known = read_last_known_speed()
     speed_mbit = args.link_mbit or detect_link_speed_mbit(iface)
+    trust_this_value = bool(speed_mbit)  # 手动指定/网卡自报的值直接信
+
     if speed_mbit:
         logging.info("探测到链路速率: %smbit", speed_mbit)
-    elif not args.no_speedtest:
+    elif args.no_speedtest:
+        pass
+    elif speedtest_unsafe and not args.force_speedtest:
+        logging.warning(
+            "当前有 %d 个建立态连接，属于高并发机器——这个时候测速大概率会被真实流量"
+            "抢占带宽/CPU，测出的数字不可信，直接跳过这次测速（不采信任何测速结果）。"
+            "如果你确认现在适合测，可以加 --force-speedtest 强制测。",
+            established,
+        )
+    else:
         logging.info("网卡没有上报真实速率（虚拟网卡常见），尝试实测一次（会消耗一些流量，耗时数秒到十几秒）...")
         down_mbit, up_mbit = run_speedtest()
         if up_mbit:
-            speed_mbit = int(up_mbit)
+            candidate = int(up_mbit)
             logging.info(
-                "实测完成: 上传≈%.1fmbit 下载≈%.1fmbit（出口限速用上传值作参考，仅供参考不是权威真实带宽）",
+                "实测完成: 上传≈%.1fmbit 下载≈%.1fmbit（出口限速用上传值作参考）",
                 up_mbit, down_mbit or 0,
             )
+            # 理智检查：如果这次实测结果比历史记录低很多，大概率是测速时机不好
+            # （机器上有大量真实流量在抢带宽/CPU，单条连接单次测速容易严重失真），
+            # 而不是带宽真的降了。默认不采信这种断崖式下跌，除非显式加 --force-speedtest。
+            if last_known and candidate < last_known * 0.5 and not args.force_speedtest:
+                logging.warning(
+                    "这次实测(%.0fmbit)比上次记录(%.0fmbit)低了一半以上，很可能是测速时机不好"
+                    "（这台机器当下有真实流量在抢带宽/CPU，单次测速容易失真），本次沿用历史记录，"
+                    "不采信这次实测结果。如果你确认带宽确实下降了，加 --force-speedtest 强制采信。",
+                    candidate, last_known,
+                )
+                speed_mbit = int(last_known)
+                trust_this_value = True
+            else:
+                speed_mbit = candidate
+                trust_this_value = True
         else:
-            logging.warning("实测也失败了（可能是这台机器出不了公网，或者被墙），退回保守默认值")
+            logging.warning("实测也失败了（可能是这台机器出不了公网，或者被墙）")
+
+    if not speed_mbit and last_known:
+        speed_mbit = int(last_known)
+        trust_this_value = True
+        logging.warning("这次没能探测到任何真实速率，沿用上次记录的 %smbit", speed_mbit)
 
     if not speed_mbit:
         speed_mbit = 1000
+        trust_this_value = False
         logging.warning("最终没能测出真实速率，使用保守默认值 %smbit。可以用 --link-mbit 手动指定更准确的值。", speed_mbit)
+
+    # 只记录『有依据』的判断结果，不把没有任何信息支撑的保守默认值当成历史基准存下来
+    if trust_this_value:
+        write_last_known_speed(speed_mbit)
 
     classid = args.classid or "1:10"
 
-    # 自动探测并发连接数，据此挑一套合适的默认参数（用户显式传的参数优先级更高，不会被覆盖）
-    established = detect_established_connections()
-    profile = pick_profile_by_concurrency(established)
-    logging.info("探测到机器画像: %s -> 建议参数 interval=%ss retrans_pct_threshold=%s%% min_pct=%s max_pct=%s",
+    logging.info("机器画像: %s -> 建议参数 interval=%ss retrans_pct_threshold=%s%% min_pct=%s max_pct=%s",
                  profile["label"], profile["interval"], profile["retrans_pct_threshold"],
                  profile["min_pct"], profile["max_pct"])
 
@@ -1051,7 +1114,7 @@ def run_menu():
             up_step=None, down_step=None,
             retrans_pct_threshold=None, drop_threshold=None,
             cpu_pct_threshold=None, softirq_pct_threshold=None,
-            no_speedtest=False,
+            no_speedtest=False, force_speedtest=False,
         ))
     elif choice == "2":
         cmd_check(argparse.Namespace(iface=None, classid=None))
@@ -1124,6 +1187,8 @@ def main():
                          help="软中断占比异常阈值(%%)，默认 30")
     p_auto.add_argument("--no-speedtest", dest="no_speedtest", action="store_true",
                          help="网卡探测不到真实速率时，不要额外做一次实测（默认会做）")
+    p_auto.add_argument("--force-speedtest", dest="force_speedtest", action="store_true",
+                         help="即使这次实测结果比历史记录低很多，也强制采信这次实测（默认会保守地沿用历史记录）")
     p_auto.set_defaults(func=cmd_auto)
 
     p_speedtest = sub.add_parser("speedtest", help="单独测一次上传/下载速度（用 Cloudflare 节点，不需要你自己准备对端）")
