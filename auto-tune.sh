@@ -1116,10 +1116,9 @@ def cmd_auto(args):
       --drop-threshold            判定异常的单周期 qdisc drop 数量阈值
       --cpu-pct-threshold          CPU 总体繁忙占比异常阈值
       --softirq-pct-threshold      软中断占比异常阈值
-    带宽探测顺序：--link-mbit 手动指定 > 网卡自报速率(ethtool/sysfs) > 历史记录 > 保守默认值 1000。
-    实测测速(Ookla Speedtest CLI)默认不再自动跑——
-    在某些网络环境下这条路本身就不通/不稳定，而且高并发环境下测出来的数字也常常不准，
-    与其自动跑一个不可靠的测速，不如默认不跑，交给你自己判断要不要用 --try-speedtest 显式开启。
+    带宽探测顺序：--link-mbit 手动指定 > 网卡自报速率(ethtool/sysfs) > 实测测速(Ookla Speedtest CLI) > 历史记录 > 保守默认值 1000。
+    默认探测不到网卡速率就会自动测速一次，测出什么就用什么，不做额外判断。
+    不想测的话用 --no-speedtest 关掉。
     """
     require_root()
 
@@ -1132,54 +1131,28 @@ def cmd_auto(args):
         sys.exit(1)
     logging.info("使用网卡: %s", iface)
 
-    # 提前探测并发连接数，一是用来挑参数画像，二是用来判断『现在适不适合测速』——
-    # 已经有大量真实连接在跑的机器，测速结果天然会被真实流量抢占带宽/CPU 拖低，
-    # 与其测完再靠历史记录去纠正，不如一开始就跳过这次测速。
     established = detect_established_connections()
     profile = pick_profile_by_concurrency(established)
-    speedtest_unsafe = established is not None and established >= 500
-    want_speedtest = args.try_speedtest or args.force_speedtest  # 显式要求才会真的去跑 speedtest
 
-    # 2. 探测链路速率：手动指定 > 网卡自报 > 实测测速（默认关闭，显式开启才做，有历史记录做理智检查）> 历史记录 > 保守默认值
+    # 2. 探测链路速率：手动指定 > 网卡自报 > 实测测速 > 历史记录 > 保守默认值
     last_known = read_last_known_speed()
     speed_mbit = args.link_mbit or detect_link_speed_mbit(iface)
     trust_this_value = bool(speed_mbit)  # 手动指定/网卡自报的值直接信
 
     if speed_mbit:
         logging.info("探测到链路速率: %smbit", speed_mbit)
-    elif not want_speedtest:
-        logging.info("未指定 --link-mbit，也没有开启实测测速（默认不跑，加 --try-speedtest 才会试）")
-    elif speedtest_unsafe and not args.force_speedtest:
-        logging.warning(
-            "当前有 %d 个建立态连接，属于高并发机器——这个时候测速大概率会被真实流量"
-            "抢占带宽/CPU，测出的数字不可信，直接跳过这次测速（不采信任何测速结果）。"
-            "如果你确认现在适合测，可以加 --force-speedtest 强制测。",
-            established,
-        )
+    elif args.no_speedtest:
+        logging.info("网卡没有上报真实速率，且已用 --no-speedtest 关闭实测测速")
     else:
         logging.info("尝试实测一次（用 Ookla Speedtest CLI，会消耗一些流量，耗时数秒到十几秒）...")
         down_mbit, up_mbit = run_speedtest()
         if up_mbit:
-            candidate = int(up_mbit)
+            speed_mbit = int(up_mbit)
+            trust_this_value = True
             logging.info(
                 "实测完成: 上传≈%.1fmbit 下载≈%.1fmbit（出口限速用上传值作参考）",
                 up_mbit, down_mbit or 0,
             )
-            # 理智检查：如果这次实测结果比历史记录低很多，大概率是测速时机不好
-            # （机器上有大量真实流量在抢带宽/CPU，单条连接单次测速容易严重失真），
-            # 而不是带宽真的降了。默认不采信这种断崖式下跌，除非显式加 --force-speedtest。
-            if last_known and candidate < last_known * 0.5 and not args.force_speedtest:
-                logging.warning(
-                    "这次实测(%.0fmbit)比上次记录(%.0fmbit)低了一半以上，很可能是测速时机不好"
-                    "（这台机器当下有真实流量在抢带宽/CPU，单次测速容易失真），本次沿用历史记录，"
-                    "不采信这次实测结果。如果你确认带宽确实下降了，加 --force-speedtest 强制采信。",
-                    candidate, last_known,
-                )
-                speed_mbit = int(last_known)
-                trust_this_value = True
-            else:
-                speed_mbit = candidate
-                trust_this_value = True
         else:
             logging.warning(
                 "实测失败（Speedtest CLI 没找到能连上的测速节点，可能是这台机器出不了公网、"
@@ -1391,7 +1364,7 @@ def run_menu():
             up_step=None, down_step=None,
             retrans_pct_threshold=None, drop_threshold=None,
             cpu_pct_threshold=None, softirq_pct_threshold=None,
-            no_speedtest=False, force_speedtest=False, max_only=False, no_sysctl_tune=False, try_speedtest=False,
+            no_speedtest=False, max_only=False, no_sysctl_tune=False,
         ))
     elif choice == "2":
         cmd_check(argparse.Namespace(iface=None, classid=None))
@@ -1470,10 +1443,8 @@ def main():
                          help="CPU 总体繁忙占比异常阈值(%%)，默认 90")
     p_auto.add_argument("--softirq-pct-threshold", dest="softirq_pct_threshold", type=float,
                          help="软中断占比异常阈值(%%)，默认 30")
-    p_auto.add_argument("--try-speedtest", dest="try_speedtest", action="store_true",
-                         help="网卡探测不到真实速率时，尝试用 Ookla Speedtest CLI 测一次（默认不测，需要显式开启）")
-    p_auto.add_argument("--force-speedtest", dest="force_speedtest", action="store_true",
-                         help="强制测速并采信结果，即使当前高并发或者结果比历史记录低很多（隐含开启 --try-speedtest）")
+    p_auto.add_argument("--no-speedtest", dest="no_speedtest", action="store_true",
+                         help="网卡探测不到真实速率时，不要额外做一次实测（默认会做）")
     p_auto.add_argument("--max-only", dest="max_only", action="store_true",
                          help="直接跑满 max-ceil，不再自动降速，只监控展示（不在乎稳不稳、只要跑满带宽时用）")
     p_auto.add_argument("--no-sysctl-tune", dest="no_sysctl_tune", action="store_true",
