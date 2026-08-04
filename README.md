@@ -1,1 +1,1 @@
-bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库名/main/auto-tune.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库名/main/auto-tune.sh)
