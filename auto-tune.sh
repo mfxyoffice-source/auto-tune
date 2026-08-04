@@ -860,14 +860,26 @@ def cmd_tune(args):
         logging.error("min-rate 必须小于 max-ceil")
         sys.exit(1)
 
-    current = get_class_current_rate(iface, classid)
-    if current is None:
+    raw_current = get_class_current_rate(iface, classid)
+    if raw_current is None:
         logging.warning(
             "读取不到 class %s 当前 ceil，可能尚未创建。将以 min-rate 作为起点。"
             "请先手动 tc class add 建好该 class。", classid
         )
-        current = min_bps
-    current = max(min_bps, min(current, max_bps))
+        raw_current = min_bps
+    current = max(min_bps, min(raw_current, max_bps))
+
+    # 关键修复：如果网卡上现在的实际速率跟『夹到范围内』之后的值不一样（比如网卡上还
+    # 残留着一个超出 [min_rate, max_ceil] 范围的旧值），必须马上把这个新值真正下发给
+    # tc，不能只在 Python 变量里改。不然会出现『内存里以为已经是 600mbit，但网卡上
+    # 其实还是旧的 57mbit』这种两边对不上的情况——因为后续的 AIMD 判断只在『速率产生
+    # 变化』时才会调用 apply_rate，如果这次没有真正生效，就会一直卡在错的值上。
+    if abs(current - raw_current) / max(raw_current, 1) > 0.005:
+        logging.warning(
+            "网卡上现有速率(%s)超出配置范围[%s, %s]，先强制同步到 %s",
+            bps_to_rate_str(raw_current), min_rate, max_ceil, bps_to_rate_str(current),
+        )
+        apply_rate(iface, classid, current * 0.9, current, dry_run)
 
     if max_only:
         # 跑满模式：直接顶到 max_ceil，之后只监控展示，不再根据重传/丢包/CPU 自动降速。
