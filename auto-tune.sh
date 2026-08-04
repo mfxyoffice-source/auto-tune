@@ -69,6 +69,7 @@ INSTALL_DIR = "/opt/auto-tune"
 CONFIG_DIR = "/etc/auto-tune"
 ENV_PATH = f"{CONFIG_DIR}/auto-tune.env"
 STATE_PATH = f"{CONFIG_DIR}/last-known-speed.mbit"
+STATE_PATH_DOWN = f"{CONFIG_DIR}/last-known-speed-down.mbit"
 SERVICE_PATH = "/etc/systemd/system/auto-tune.service"
 SYSCTL_BACKUP_DIR = "/etc/auto-tune/sysctl-backup"
 SYSCTL_TUNE_FILE = "/etc/sysctl.d/99-auto-tune.conf"
@@ -260,6 +261,10 @@ def cmd_check(args):
     bbr_active = get_current_congestion_control() == "bbr"
     print(f"BBR 是否可用        : {'是' if bbr_available else '否（内核可能未编译 BBR 模块）'}")
     print(f"BBR 是否已启用      : {'是' if bbr_active else '否'}")
+    last_up = read_last_known_speed()
+    last_down = read_last_known_speed_down()
+    print(f"上次测得上行速率    : {f'{last_up:.1f}mbit' if last_up else '(还没测过)'}")
+    print(f"上次测得下行速率    : {f'{last_down:.1f}mbit（仅供参考，不参与任何限速判断）' if last_down else '(还没测过)'}")
     print()
     print("关键 sysctl 值：")
     for key in [
@@ -570,8 +575,7 @@ def run_speedtest(timeout=60):
 
 
 def read_last_known_speed():
-    """读取上一次 auto 判定出来的『可信』链路速率（mbit），读不到返回 None。
-    用来在这次实测结果明显异常偏低时做个理智检查，不轻易被单次失真的测速带偏。"""
+    """读取上一次判定出来的『可信』上行速率（mbit），读不到返回 None。"""
     try:
         with open(STATE_PATH) as f:
             return float(f.read().strip())
@@ -580,11 +584,31 @@ def read_last_known_speed():
 
 
 def write_last_known_speed(mbit):
-    """记录这次判定出来的链路速率，供下次 auto 运行时做理智检查。
-    写入失败不影响主流程，静默忽略。"""
+    """记录这次判定出来的上行速率，供下次参考。写入失败不影响主流程，静默忽略。"""
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(STATE_PATH, "w") as f:
+            f.write(f"{mbit}\n")
+    except OSError:
+        pass
+
+
+def read_last_known_speed_down():
+    """读取上一次测出来的下行速率（mbit），读不到返回 None。
+    这个数字仅供你参考这台机器下行大概什么水平，脚本不会拿它去做任何限速决策
+    （下载方向从头到尾没有被这套工具限速过）。"""
+    try:
+        with open(STATE_PATH_DOWN) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def write_last_known_speed_down(mbit):
+    """记录这次测出来的下行速率。写入失败不影响主流程，静默忽略。"""
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(STATE_PATH_DOWN, "w") as f:
             f.write(f"{mbit}\n")
     except OSError:
         pass
@@ -595,10 +619,12 @@ def cmd_speedtest(args):
     down_mbit, up_mbit = run_speedtest()
     if down_mbit:
         print(f"下载: {down_mbit:.1f} Mbit/s")
+        write_last_known_speed_down(down_mbit)
     else:
         print("下载: 测速失败")
     if up_mbit:
         print(f"上传: {up_mbit:.1f} Mbit/s")
+        write_last_known_speed(up_mbit)
     else:
         print("上传: 测速失败")
     print()
@@ -1132,9 +1158,11 @@ def cmd_auto(args):
       --drop-threshold            判定异常的单周期 qdisc drop 数量阈值
       --cpu-pct-threshold          CPU 总体繁忙占比异常阈值
       --softirq-pct-threshold      软中断占比异常阈值
-    带宽探测顺序：--link-mbit 手动指定 > 网卡自报速率(ethtool/sysfs) > 实测测速(Ookla Speedtest CLI) > 历史记录 > 保守默认值 1000。
-    默认探测不到网卡速率就会自动测速一次，测出什么就用什么，不做额外判断。
-    不想测的话用 --no-speedtest 关掉。
+    带宽探测顺序：--link-mbit 手动指定 > 网卡自报速率(ethtool/sysfs) > 历史记录 > 保守默认值 1000。
+    注意：speedtest 测速工具跟这条判断链完全无关——speedtest 只是给你自己看数字用的独立
+    诊断工具（对应 speedtest 子命令 / 菜单里的『测速』选项），不会被 auto 自动调用、
+    不会影响任何配置。这台机器上并发一高，单次测速的数字天然不准，直接拿来配置反而有害，
+    所以 auto 从不采信测速结果。
     """
     require_root()
 
@@ -1150,30 +1178,15 @@ def cmd_auto(args):
     established = detect_established_connections()
     profile = pick_profile_by_concurrency(established)
 
-    # 2. 探测链路速率：手动指定 > 网卡自报 > 实测测速 > 历史记录 > 保守默认值
+    # 2. 探测链路速率：手动指定 > 网卡自报 > 历史记录 > 保守默认值（不包含测速）
     last_known = read_last_known_speed()
     speed_mbit = args.link_mbit or detect_link_speed_mbit(iface)
     trust_this_value = bool(speed_mbit)  # 手动指定/网卡自报的值直接信
 
     if speed_mbit:
         logging.info("探测到链路速率: %smbit", speed_mbit)
-    elif args.no_speedtest:
-        logging.info("网卡没有上报真实速率，且已用 --no-speedtest 关闭实测测速")
     else:
-        logging.info("尝试实测一次（用 Ookla Speedtest CLI，会消耗一些流量，耗时数秒到十几秒）...")
-        down_mbit, up_mbit = run_speedtest()
-        if up_mbit:
-            speed_mbit = int(up_mbit)
-            trust_this_value = True
-            logging.info(
-                "实测完成: 上传≈%.1fmbit 下载≈%.1fmbit（出口限速用上传值作参考）",
-                up_mbit, down_mbit or 0,
-            )
-        else:
-            logging.warning(
-                "实测失败（Speedtest CLI 没找到能连上的测速节点，可能是这台机器出不了公网、"
-                "被墙、或者这条路径本身就不通），不采信任何结果"
-            )
+        logging.info("网卡没有上报真实速率（虚拟网卡常见），不会自动测速，改用历史记录/默认值")
 
     if not speed_mbit and last_known:
         speed_mbit = int(last_known)
@@ -1355,15 +1368,40 @@ def read_tty_line(prompt):
         return None
 
 
+def _default_auto_namespace(link_mbit=None):
+    """构造一份 cmd_auto 需要的最小 Namespace，菜单里几个选项复用它，避免重复列一遍字段。"""
+    return argparse.Namespace(
+        iface=None, classid=None, link_mbit=link_mbit,
+        min_pct=None, max_pct=None, interval=None,
+        up_step=None, down_step=None,
+        retrans_pct_threshold=None, drop_threshold=None,
+        cpu_pct_threshold=None, softirq_pct_threshold=None,
+        max_only=False, no_sysctl_tune=False,
+    )
+
+
 def run_menu():
     require_root()
-    print("""
+
+    # 默认先探测一次网卡自报速率（不测速，纯读取网卡信息，瞬间完成、不消耗流量），
+    # 让你在选菜单之前就能看到当前网卡自己是怎么说的，供参考。
+    probe_iface = detect_default_iface()
+    probe_speed = detect_link_speed_mbit(probe_iface) if probe_iface else None
+    last_up = read_last_known_speed()
+    last_down = read_last_known_speed_down()
+
+    print(f"""
 ======================================================================
   auto-tune — VPS 网络调优（BBR + 出口带宽 AIMD 动态调整）
 ======================================================================
-  1) 全自动部署   探测网卡/带宽 -> 建拓扑 -> 开 BBR -> 写配置 -> 启动服务  [默认]
-  2) 只读检查     查看当前 BBR / qdisc / sysctl 状态，不改任何东西
-  3) 卸载         停止并移除已安装的服务和文件
+  网卡: {probe_iface or '探测失败'}   网卡自报速率: {f'{probe_speed}mbit' if probe_speed else '无法探测（虚拟网卡常见）'}
+  上次记录的上行: {f'{last_up:.0f}mbit' if last_up else '无'}   上次记录的下行: {f'{last_down:.0f}mbit（仅供参考）' if last_down else '无'}
+----------------------------------------------------------------------
+  1) 全自动部署         用已知带宽(手动/网卡自报/历史记录)建拓扑->开BBR->写配置->启动服务  [默认]
+  2) 手动输入上下行带宽  写入配置并立即部署（上行用于限速，下行仅记录，不参与限速）
+  3) 测速                只测试查看，不影响任何配置
+  4) 只读检查            查看当前 BBR / qdisc / sysctl 状态，不改任何东西
+  5) 卸载                停止并移除已安装的服务和文件
   0) 退出
 ======================================================================""")
     raw = read_tty_line("请输入数字后回车（直接回车 = 1）: ")
@@ -1374,21 +1412,45 @@ def run_menu():
         choice = raw.strip() or "1"
 
     if choice == "1":
-        cmd_auto(argparse.Namespace(
-            iface=None, classid=None, link_mbit=None,
-            min_pct=None, max_pct=None, interval=None,
-            up_step=None, down_step=None,
-            retrans_pct_threshold=None, drop_threshold=None,
-            cpu_pct_threshold=None, softirq_pct_threshold=None,
-            no_speedtest=False, max_only=False, no_sysctl_tune=False,
-        ))
+        cmd_auto(_default_auto_namespace())
+
     elif choice == "2":
-        cmd_check(argparse.Namespace(iface=None, classid=None))
+        up_mbit = None
+        up_raw = read_tty_line("手动输入上行带宽(Mbit，用于限速配置，必填): ")
+        if up_raw is not None and up_raw.strip():
+            try:
+                up_mbit = int(float(up_raw.strip()))
+            except ValueError:
+                logging.warning("输入的不是数字（%r）", up_raw.strip())
+        if not up_mbit:
+            print("没有输入有效的上行带宽，取消，未做任何修改。")
+            sys.exit(1)
+
+        down_raw = read_tty_line("手动输入下行带宽(Mbit，仅记录参考，不影响限速，不知道可直接回车跳过): ")
+        if down_raw is not None and down_raw.strip():
+            try:
+                down_mbit = float(down_raw.strip())
+                write_last_known_speed_down(down_mbit)
+                logging.info("已记录下行带宽: %smbit（仅供参考）", down_mbit)
+            except ValueError:
+                logging.warning("下行带宽输入的不是数字（%r），跳过记录", down_raw.strip())
+
+        logging.info("使用手动输入的上行带宽: %smbit，写入配置并立即部署", up_mbit)
+        cmd_auto(_default_auto_namespace(link_mbit=up_mbit))
+
     elif choice == "3":
+        cmd_speedtest(argparse.Namespace())
+
+    elif choice == "4":
+        cmd_check(argparse.Namespace(iface=None, classid=None))
+
+    elif choice == "5":
         cmd_uninstall(argparse.Namespace(purge_config=False))
+
     elif choice == "0":
         print("已退出，未做任何修改。")
         sys.exit(0)
+
     else:
         print(f"无效输入: {choice!r}，未做任何修改。")
         sys.exit(1)
@@ -1459,8 +1521,6 @@ def main():
                          help="CPU 总体繁忙占比异常阈值(%%)，默认 90")
     p_auto.add_argument("--softirq-pct-threshold", dest="softirq_pct_threshold", type=float,
                          help="软中断占比异常阈值(%%)，默认 30")
-    p_auto.add_argument("--no-speedtest", dest="no_speedtest", action="store_true",
-                         help="网卡探测不到真实速率时，不要额外做一次实测（默认会做）")
     p_auto.add_argument("--max-only", dest="max_only", action="store_true",
                          help="直接跑满 max-ceil，不再自动降速，只监控展示（不在乎稳不稳、只要跑满带宽时用）")
     p_auto.add_argument("--no-sysctl-tune", dest="no_sysctl_tune", action="store_true",
