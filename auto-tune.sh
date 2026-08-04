@@ -745,11 +745,6 @@ def read_proc_net_snmp_tcp():
     return retrans, out_segs
 
 
-def get_tcp_retrans_total():
-    """兼容旧接口，仅返回重传总数（不换算比例的场景用，目前仅 check 之外无调用）。"""
-    retrans, _ = get_tcp_stats()
-    return retrans
-
 
 # --------------------------------------------------------------------------
 # CPU / 软中断占用监控（判断瓶颈是不是压根不在网络路径上，而是这台机器算力扛不住了）
