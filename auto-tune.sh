@@ -463,7 +463,12 @@ def ensure_ookla_speedtest_installed():
     注意：不是同名的 speedtest-cli（sivel 写的那个第三方开源工具）——那个项目已经在
     2026年1月被作者归档、停止维护，而且在较新的系统上有已知的『测出来永远是0』的
     坏结果，所以这里特意换成 Ookla 自己出的、持续维护的官方版本，命令名是 `speedtest`
-    不是 `speedtest-cli`。"""
+    不是 `speedtest-cli`。
+
+    安装方式：直接从 Ookla 自己的域名（install.speedtest.net）下载免安装二进制包，
+    不走 apt 仓库/packagecloud.io——那条路依赖第三方托管平台 packagecloud.io，
+    历史上出现过多次该平台计费/服务问题导致仓库返回 402 Payment Required 的先例
+    （不止 Ookla 一家遇到过），不够稳定，直接用官方二进制更省心。"""
     def is_official_ookla():
         if not shutil.which("speedtest"):
             return False
@@ -473,35 +478,40 @@ def ensure_ookla_speedtest_installed():
     if is_official_ookla():
         return True
 
-    logging.info("未检测到 Ookla 官方 Speedtest CLI，尝试自动安装...")
+    logging.info("未检测到 Ookla 官方 Speedtest CLI，尝试从官方直链下载二进制安装...")
 
     # 先移除可能冲突的旧版第三方 speedtest-cli（已归档不维护，装了反而可能干扰）
     run("apt-get remove -y speedtest-cli", check=False, timeout=30)
 
-    # Debian/Ubuntu 系：加官方仓库再装
-    run(
-        "curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash",
-        check=False, timeout=60,
-    )
-    list_path = "/etc/apt/sources.list.d/ookla_speedtest-cli.list"
-    if os.path.exists(list_path):
-        # Ookla 的仓库脚本有时候还没跟上最新的 Ubuntu 代号（比如 24.04 的 noble），
-        # 兼容处理成用已知支持的 jammy(22.04) 源，装的包本身没问题
-        run(f"sed -i 's/noble/jammy/g; s/plucky/jammy/g; s/oracular/jammy/g' {list_path}", check=False)
-        run("apt-get update -y", check=False, timeout=60)
-    run("apt-get install -y speedtest", check=False, timeout=60)
-    if is_official_ookla():
-        return True
+    arch = run("uname -m", check=False).strip()
+    arch_map = {
+        "x86_64": "linux-x86_64",
+        "amd64": "linux-x86_64",
+        "i386": "linux-i386",
+        "i686": "linux-i386",
+        "aarch64": "linux-aarch64",
+        "arm64": "linux-aarch64",
+        "armv7l": "linux-armhf",
+        "armv6l": "linux-armel",
+    }
+    tgz_arch = arch_map.get(arch)
+    if not tgz_arch:
+        logging.warning("未知的 CPU 架构 %s，没法确定该下载哪个二进制包，安装失败", arch)
+        return False
 
-    # RHEL/CentOS 系兜底
-    run(
-        "curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash",
-        check=False, timeout=60,
-    )
-    run("yum install -y speedtest", check=False, timeout=60)
-    if is_official_ookla():
-        return True
-    run("dnf install -y speedtest", check=False, timeout=60)
+    version = "1.2.0"
+    url = f"https://install.speedtest.net/app/cli/ookla-speedtest-{version}-{tgz_arch}.tgz"
+    tmp_dir = "/tmp/auto-tune-speedtest-install"
+    run(f"rm -rf {tmp_dir} && mkdir -p {tmp_dir}", check=False)
+    dl_ok = run(f"curl -fsSL {url} -o {tmp_dir}/speedtest.tgz && echo OK", check=False, timeout=60)
+    if "OK" not in dl_ok:
+        logging.warning("从 %s 下载失败", url)
+        run(f"rm -rf {tmp_dir}", check=False)
+        return False
+
+    run(f"tar xzf {tmp_dir}/speedtest.tgz -C {tmp_dir}", check=False, timeout=30)
+    run(f"install -m 755 {tmp_dir}/speedtest /usr/local/bin/speedtest", check=False)
+    run(f"rm -rf {tmp_dir}", check=False)
 
     return is_official_ookla()
 
